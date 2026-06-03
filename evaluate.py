@@ -50,6 +50,8 @@ from graph import (
     graph as _default_graph,
     build_initial_state,
     requires_human_node,
+    route_after_architecture,
+    route_after_engineering,
     RECURSION_LIMIT,
 )
 from cleanup import cleanup_row as _cleanup_row
@@ -96,12 +98,17 @@ def build_no_secu_graph():
     _shared_deploy_edges(g)
 
     g.add_edge(START, "architecture")
-    g.add_edge("architecture", "engineering")
-    g.add_edge("engineering",  "validation")
+    g.add_conditional_edges("architecture", route_after_architecture, {
+        "security":       "engineering",   # secu absent → fall back to engi
+        "requires_human": "requires_human",
+    })
+    g.add_conditional_edges("engineering", route_after_engineering, {
+        "validation":     "validation",
+        "requires_human": "requires_human",
+    })
     g.add_conditional_edges("validation", route_after_validation, {
         "deployment":     "deployment",
         "architecture":   "architecture",
-        "security":       "engineering",   # secu absent → fall back to engi
         "engineering":    "engineering",
         "requires_human": "requires_human",
     })
@@ -119,13 +126,18 @@ def build_no_deploy_graph():
     g.add_node("requires_human", requires_human_node)
 
     g.add_edge(START, "architecture")
-    g.add_edge("architecture", "security")
-    g.add_edge("security",     "engineering")
-    g.add_edge("engineering",  "validation")
+    g.add_conditional_edges("architecture", route_after_architecture, {
+        "security":       "security",
+        "requires_human": "requires_human",
+    })
+    g.add_edge("security", "engineering")
+    g.add_conditional_edges("engineering", route_after_engineering, {
+        "validation":     "validation",
+        "requires_human": "requires_human",
+    })
     g.add_conditional_edges("validation", route_after_validation, {
         "deployment":     END,             # validation pass → kết thúc (không deploy)
         "architecture":   "architecture",
-        "security":       "security",
         "engineering":    "engineering",
         "requires_human": "requires_human",
     })
@@ -142,12 +154,17 @@ def build_no_secu_no_deploy_graph():
     g.add_node("requires_human", requires_human_node)
 
     g.add_edge(START, "architecture")
-    g.add_edge("architecture", "engineering")
-    g.add_edge("engineering",  "validation")
+    g.add_conditional_edges("architecture", route_after_architecture, {
+        "security":       "engineering",   # secu absent → fall back to engi
+        "requires_human": "requires_human",
+    })
+    g.add_conditional_edges("engineering", route_after_engineering, {
+        "validation":     "validation",
+        "requires_human": "requires_human",
+    })
     g.add_conditional_edges("validation", route_after_validation, {
         "deployment":     END,
         "architecture":   "architecture",
-        "security":       "engineering",
         "engineering":    "engineering",
         "requires_human": "requires_human",
     })
@@ -168,7 +185,8 @@ def _select_graph(no_secu: bool, no_deploy: bool):
 # ─── CSV helpers (same as test_pipeline.py) ──────────────────────────────────
 
 def load_csv(limit: int | None) -> list[tuple[int, str, str, list[str]]]:
-    rows = list(csv.DictReader(open(CSV_PATH, encoding="utf-8")))
+    with open(CSV_PATH, encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
     if limit:
         rows = rows[:limit]
     result = []
@@ -388,6 +406,7 @@ def run_row_lg(
     final_state = dict(state)
     iterations = 0
     t_prev = time.time()
+    _stream_error: str | None = None
 
     try:
         for chunk in g.stream(
@@ -485,6 +504,7 @@ def run_row_lg(
         import traceback
         log(f"  [ERROR] graph.stream exception: {e}")
         log(traceback.format_exc())
+        _stream_error = str(e)
 
     # Post-row AWS cleanup — safety net sau auto_destroy A5.
     # Chỉ chạy khi có deploy thật (no_deploy=False); idempotent (NotFound bị bỏ qua).
@@ -498,6 +518,10 @@ def run_row_lg(
     # Cleanup per-run dir
     if run_dir.exists():
         shutil.rmtree(run_dir, ignore_errors=True)
+
+    # graph.stream crash → trả sentinel ngay (cleanup đã xong, kết quả partial không tin được)
+    if _stream_error:
+        return _timeout_sentinel((idx, difficulty, prompt), error=_stream_error), "\n".join(lines)
 
     # Extract structured results
     archi_result, secu_result, engi_result, val_result, deploy_result = _extract_results(
@@ -530,7 +554,10 @@ def run_row_lg(
         "val":    val_result,
         "deploy": deploy_result,
         "total_retry_count":  final_state.get("total_attempts", 0),
-        "deploy_retry_count": (final_state.get("retries") or {}).get("deploy", {}).get("count", 0),
+        "deploy_retry_count": (
+            (final_state.get("retries") or {}).get("deploy_eng",  {}).get("count", 0) +
+            (final_state.get("retries") or {}).get("deploy_arch", {}).get("count", 0)
+        ),
         "routing_log": final_state.get("routing_log", []),
         "iterations":  iterations,
         "resource_match": cmp,

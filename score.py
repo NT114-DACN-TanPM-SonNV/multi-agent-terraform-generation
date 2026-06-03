@@ -35,7 +35,8 @@ _MAX_K = 5
 
 
 def _load_dataset(csv_path: Path) -> dict[int, dict]:
-    rows = list(csv.DictReader(open(csv_path, encoding="utf-8")))
+    with open(csv_path, encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
     return {i: row for i, row in enumerate(rows)}
 
 
@@ -98,7 +99,8 @@ def _score_row(run_row: dict, gold: dict, do_rego: bool, do_checkov: bool,
 
     # Posture A2 phán + số check enforced (để phân tích, KHÔNG phải metric chấm điểm).
     secu = run_row.get("secu") or {}
-    scored["security_selected"] = secu.get("ckv_total", 0)
+    prof = secu.get("security_profile") or {}
+    scored["security_selected"] = sum(len(v.get("checks", [])) for v in prof.values())
 
     return scored
 
