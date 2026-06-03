@@ -25,8 +25,8 @@ Tại sao bỏ posture (minimal/standard/strict)?
   - A4 không cần level/tier trung gian, chỉ cần `check_ids = set(checks)` per resource
 
 Tại sao A2 fail không chặn pipeline?
-  - Fail → profile với checks=[] cho mọi resource, security_agent_failed=True
-  - A4 đọc security_agent_failed → skip gate → best-effort deploy
+  - Fail → profile với checks=[] cho mọi resource
+  - A4 gọi _targets_for_plan(profile) → target_ids=set() → skip gate → PASS ngay
 """
 import json
 import logging
@@ -170,7 +170,7 @@ def security_node(state: AgentState) -> dict:
             else:
                 logger.warning("Security agent failed: %s — checks=[] cho mọi resource", e)
                 profile = _clean_profile({}, resources)
-                return {"security_profile": profile, "security_agent_failed": True}
+                return {"security_profile": profile}
 
     if not isinstance(parsed, dict):
         parsed = {}

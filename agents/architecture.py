@@ -10,7 +10,7 @@ Input: state["prompt"] (user request), optional state["fix_feedback"] (fix instr
 Output: state["infrastructure_plan"] (dict resources + data_sources) hoặc error
 
 Retry logic:
-  - retries["arch"] max 2 (từ A4 MISSING_RESOURCE + A5 MISSING_RESOURCE)
+  - retries["val_arch"] max 2 (từ A4) + retries["deploy_arch"] max 2 (từ A5) — độc lập
   - Khi hết budget → requires_human
 """
 import logging
@@ -143,13 +143,18 @@ def architecture_node(state: AgentState) -> dict:
                 len(plan["resources"]), len(plan["data_sources"]))
 
     # ── Step 4: Cập nhật state ──────────────────────────────────────────────────
-    # Reset eng/sec: re-plan = code mới → lỗi cũ không còn liên quan, tránh cạn budget oan.
-    # Không reset "arch" (budget vòng re-plan) và "deploy" (vòng A5 riêng).
+    # Reset eng/sec sau re-plan: code mới → lỗi cũ từ A4/A5 không còn liên quan.
+    # Giữ val_arch/deploy_arch (budget vòng re-plan, không được reset).
     blank = {"count": 0, "last_error_type": "", "last_error_details": "", "error_history": []}
     out: dict = {
         "infrastructure_plan": plan,
         "fix_feedback": {},
-        "retries": {**state["retries"], "eng": {**blank}, "sec": {**blank}},
+        "retries": {
+            **state["retries"],
+            "val_eng":    {**blank},
+            "deploy_eng": {**blank},
+            "sec":        {**blank},
+        },
     }
     if fix_instruction and fix_feedback.get("root_cause") == "architecture":
         out["arch_error_history"] = state["arch_error_history"] + [{"fix_instruction": fix_instruction}]

@@ -5,18 +5,23 @@ Topology:
 
     validation ─(route_after_validation)─→ deployment        (pass)
                                          → architecture       (MISSING_RESOURCE)
-                                         → engineering        (SECURITY/SYNTAX/LOGIC)
-                                         → requires_human      (INFRASTRUCTURE / hết budget / oscillation)
+                                         → engineering        (SYNTAX/LOGIC/SECURITY)
+                                         → requires_human     (INFRASTRUCTURE/budget/oscillation)
 
     deployment ─(route_after_deployment)─→ END                (success)
-                                         → deployment          (TRANSIENT retry)
-                                         → engineering         (FIXABLE — code fix)
-                                         → architecture        (MISSING_RESOURCE — re-plan)
-                                         → requires_human       (UNKNOWN/dirty/budget)
+                                         → engineering        (LOGIC — code fix)
+                                         → architecture       (MISSING_RESOURCE — re-plan)
+                                         → requires_human     (INFRASTRUCTURE/dirty/budget/OTHER)
 
-Edge tĩnh: architecture→security, security→engineering. architecture & engineering có
-conditional edge chặn fail (INFRASTRUCTURE/SYNTAX) khỏi chảy xuống làm A4 chấm nhầm code cũ/rỗng;
-engineering→validation chỉ khi A3 success.
+Edge tĩnh:
+  architecture → security   (A1 thành công luôn sang A2)
+  security → engineering    (A2 không có failure path — fail trả profile rỗng, không dừng)
+
+Conditional edge sau A1 và A3: chặn INFRASTRUCTURE fail khỏi chảy xuống
+gây A4 chấm code rỗng → loop oan. Xem route_after_architecture, route_after_engineering.
+
+TRANSIENT retry (network/throttle) của A5 xảy ra IN-NODE (vòng lặp 2 lần bên trong
+deployment_node) — không cần edge riêng vì không thay đổi state giữa các lần thử.
 """
 import logging
 import os
@@ -33,34 +38,36 @@ from agents.deployment import deployment_node, route_after_deployment
 logger = logging.getLogger(__name__)
 
 # Cao hơn default 25 vì các vòng retry (mỗi cycle 2-5 node) có thể vượt 25 trước khi
-# chạm cap total_retry_count=5 / deploy_retry_count. Worst-case (A4 5 retry + A5
-# transient/eng/arch) ~44 node → 100 cho margin; các cap retry thật mới là chốt chặn loop,
+# chạm cap total_attempts=5. Worst-case (A4 5 retry + A5 transient/eng/arch) ~44 node
+# → 100 cho margin; các cap retry thật mới là chốt chặn loop,
 # RECURSION_LIMIT chỉ là trần an toàn (không gây loop vô hạn vì cap đã bound).
 RECURSION_LIMIT = 100
 
 
 def route_after_architecture(state: AgentState) -> str:
-    """Conditional edge sau Agent 1. KHÔNG ghi state.
+    """Conditional edge sau A1. KHÔNG ghi state.
 
-    A1 LLM lỗi → architecture_node trả make_fail("INFRASTRUCTURE") (chỉ set fix_feedback, KHÔNG set
-    infrastructure_plan). Nếu cứ chảy xuôi A2→A3→A4 thì A4 thấy code rỗng → MISSING_RESOURCE
-    → route ngược về A1 → loop đốt cạn total_retry_count mà không sửa được gì. Chặn tại đây.
-    architecture_node khi success clear fix_feedback={} nên error_type chỉ còn INFRASTRUCTURE khi đúng là
-    A1 vừa fail (không nhầm với stale feedback sau MISSING_RESOURCE re-plan)."""
+    Tại sao cần?
+    A1 fail → make_fail("INFRASTRUCTURE") chỉ set fix_feedback, KHÔNG set infrastructure_plan.
+    Nếu cứ xuôi A2→A3→A4, A4 thấy code rỗng → MISSING_RESOURCE → route về A1 → loop
+    đốt cạn total_attempts mà không sửa được gì.
+
+    Tại sao check error_type thay vì infrastructure_plan rỗng?
+    A1 success luôn clear fix_feedback={}, nên error_type chỉ tồn tại khi A1 vừa fail.
+    Không nhầm với stale feedback từ MISSING_RESOURCE re-plan.
+    """
     fb = state.get("fix_feedback") or {}
     if fb.get("error_type") == "INFRASTRUCTURE":
         return "requires_human"
     return "security"
 
 
-_MAX_ARCH_RETRY = 2  # đồng bộ agents/validation.py — bound vòng A3→A1 khi plan rỗng
-
-
 def route_after_engineering(state: AgentState) -> str:
-    """Conditional edge sau Agent 3. KHÔNG ghi state.
+    """Conditional edge sau A3. KHÔNG ghi state.
 
-    engineering_node success → fix_feedback={} → error_type None → validation.
-    engineering_node fail (INFRASTRUCTURE/SYNTAX) → requires_human.
+    A3 chỉ trả INFRASTRUCTURE (LLM timeout, không sinh được resource block).
+    Không route về A4 với code bad/rỗng vì A4 sẽ chấm nhầm code cũ hoặc
+    sinh MISSING_RESOURCE giả → lãng phí retry budget.
     """
     fb = state.get("fix_feedback") or {}
     if not fb.get("error_type"):
@@ -97,19 +104,16 @@ def build_graph():
     g.add_edge("security", "engineering")
     g.add_conditional_edges("engineering", route_after_engineering, {
         "validation": "validation",
-        "architecture": "architecture",
         "requires_human": "requires_human",
     })
     g.add_conditional_edges("validation", route_after_validation, {
-        "deployment": "deployment",
-        "architecture": "architecture",
-        "security": "security",
-        "engineering": "engineering",
+        "deployment":     "deployment",
+        "architecture":   "architecture",
+        "engineering":    "engineering",
         "requires_human": "requires_human",
     })
     g.add_conditional_edges("deployment", route_after_deployment, {
         "end": END,
-        "deployment": "deployment",
         "engineering": "engineering",
         "architecture": "architecture",
         "requires_human": "requires_human",
@@ -137,15 +141,17 @@ def build_initial_state(prompt: str,
         "fix_feedback": {},
         "deployment_result": {},
         "retries": {
-            "arch": _retry_tracker(),
-            "eng": _retry_tracker(),
-            "sec": _retry_tracker(),
-            "deploy": _retry_tracker(),
+            "val_eng":    _retry_tracker(),
+            "val_arch":   _retry_tracker(),
+            "deploy_eng": _retry_tracker(),
+            "deploy_arch": _retry_tracker(),
+            "sec":        _retry_tracker(),
         },
         "total_attempts": 0,
         "routing_log": [],
         "arch_error_history": [],
         "eng_error_history": [],
+        "run_dir": "",
     }
 
 
@@ -176,5 +182,7 @@ if __name__ == "__main__":
     print(f"deployment: {final['deployment_result'].get('success')} "
           f"({final['deployment_result'].get('error_type')})")
     _retries = final.get("retries") or {}
-    print(f"total_attempts: {final.get('total_attempts', 0)}  deploy_retry: {_retries.get('deploy', {}).get('count', 0)}")
+    _deploy_retry = (_retries.get("deploy_eng", {}).get("count", 0) +
+                     _retries.get("deploy_arch", {}).get("count", 0))
+    print(f"total_attempts: {final.get('total_attempts', 0)}  deploy_retry: {_deploy_retry}")
     print(f"routing_log: {len(final['routing_log'])} entries")

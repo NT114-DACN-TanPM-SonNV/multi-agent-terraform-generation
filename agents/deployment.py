@@ -28,8 +28,8 @@ Output: state["deployment_result"] (success/error), state["fix_feedback"] (nếu
 
 Retry logic:
   - INFRASTRUCTURE: retry 1 lần in-node (như A4) — không qua graph
-  - LOGIC: eng_retry_count max 3 (shared với A4, quay A3 sửa code)
-  - MISSING_RESOURCE: arch_retry_count max 2 (shared với A4, quay A1 re-plan)
+  - LOGIC: retries["deploy_eng"] max 2 (độc lập với A4)
+  - MISSING_RESOURCE: retries["deploy_arch"] max 2 (độc lập với A4)
   - OTHER: không retry (terminal, cần human fix AWS setup)
 
 Auto-destroy (eval mode):
@@ -80,7 +80,11 @@ from core.state import AgentState
 from core.llm import call_llm
 from core.parsers import parse_llm_json
 from core.terraform import run_terraform, write_terraform_dir, terraform_workdir
-from core.retry_control import increment_retry, check_retry_budget
+from core.retry_control import (
+    increment_retry, check_retry_budget,
+    MAX_DEPLOY_ENG_RETRY, MAX_DEPLOY_ARCH_RETRY,
+)
+from core.errors import matches_any, MISSING_RESOURCE_PATTERNS
 from prompts.deployment import SYSTEM_PROMPT as _SYSTEM_PROMPT
 from prompts.deployment import (
     TOP_PROMPT as _TOP, BOTTOM_PROMPT as _BOTTOM, CLASSIFY_CONTEXT,
@@ -99,10 +103,6 @@ _DESTROY_TIMEOUT = 600
 _STATE_TIMEOUT = 30
 
 # Retry budgets cho các error type khác nhau.
-# LOGIC: shared với A4 eng_retry_count (max 3 tổng giữa A4 và A5 LOGIC)
-# MISSING_RESOURCE: shared với A4 arch_retry_count (max 2 tổng)
-_MAX_DEPLOY_ENG_RETRY  = 2
-_MAX_DEPLOY_ARCH_RETRY = 2
 
 # Patterns phân loại lỗi apply (tất định — không cần LLM).
 # Khác validation.py: A5 dùng bare "timeout"/"eof" vì apply output không có resource
@@ -116,20 +116,6 @@ _INFRASTRUCTURE_PATTERNS = (
     "vpcquotaexceeded", "limitexceeded",
 )
 
-# Resource không tồn tại trong plan → A1 re-plan với resource type đúng.
-# "not found" xuất hiện khi A1 plan dùng data source trả empty hoặc resource type sai.
-_MISSING_RESOURCE_PATTERNS = (
-    "not found", "not exist", "does not exist",
-    "invalid resource type", "unsupported",
-    "unknown resource type", "type not defined",
-    "no such resource", "resource cannot be found",
-)
-
-
-def _matches(text: str, patterns: tuple) -> bool:
-    """Case-insensitive substring match — tất định, nhanh, không tốn LLM."""
-    low = (text or "").lower()
-    return any(p in low for p in patterns)
 
 
 def _extract_error(stdout: str, stderr: str) -> str:
@@ -273,7 +259,7 @@ def _handle_failure(
       1. Pattern-based classification (tất định):
            is_timeout → INFRASTRUCTURE
            _INFRASTRUCTURE_PATTERNS match → INFRASTRUCTURE
-           _MISSING_RESOURCE_PATTERNS match → MISSING_RESOURCE
+           MISSING_RESOURCE_PATTERNS match → MISSING_RESOURCE
            else → None (cần LLM ở bước 3)
       2. Nếu timeout: terraform refresh (rebuild state từ AWS vì state có thể corrupt)
       3. Cleanup: terraform state list → terraform destroy (luôn chạy, no-op nếu state rỗng)
@@ -290,10 +276,10 @@ def _handle_failure(
     if is_timeout:
         # apply bị SIGKILL sau _APPLY_TIMEOUT → terraform state có thể bị corrupt
         error_type = "INFRASTRUCTURE"
-    elif _matches(error_text, _INFRASTRUCTURE_PATTERNS):
+    elif matches_any(error_text, _INFRASTRUCTURE_PATTERNS):
         # Network/auth/quota → không phải code bug → không route A3
         error_type = "INFRASTRUCTURE"
-    elif _matches(error_text, _MISSING_RESOURCE_PATTERNS):
+    elif matches_any(error_text, MISSING_RESOURCE_PATTERNS):
         # Resource type không tồn tại/không hỗ trợ → A1 cần re-plan
         error_type = "MISSING_RESOURCE"
     else:
@@ -345,11 +331,8 @@ def _handle_failure(
         )
 
     # ── Step 5: Increment retry counter + build base result ──────────────────
-    # LOGIC/MISSING: increment "eng"/"arch" bên dưới (sau bước này).
-    # INFRASTRUCTURE/OTHER: đều route requires_human (terminal) — increment "deploy"
-    # chỉ để bump total_attempts (global backstop) + tracking, không gate routing.
     if error_type not in ("LOGIC", "MISSING_RESOURCE"):
-        increment_retry(state, "deploy", error_type or "OTHER", error_text[:200])
+        state["total_attempts"] += 1
 
     logger.info(
         "Agent 5: FAIL %s (partial=%s destroyed=%s destroy_failed=%s)",
@@ -378,7 +361,7 @@ def _handle_failure(
     # A3 có thể fix bằng cách patch specific attribute → route engineering.
     # Điều kiện: destroy phải thành công (nếu destroy fail → dirty state → requires_human).
     if error_type == "LOGIC" and not destroy_failed:
-        increment_retry(state, "eng", "LOGIC_DEPLOY", error_text[:200])
+        increment_retry(state, "deploy_eng", "LOGIC_DEPLOY", error_text[:200])
         # fix_feedback với root_cause="engineering" → route_after_deployment → A3
         result["fix_feedback"] = {
             "overall_passed": False,
@@ -390,14 +373,14 @@ def _handle_failure(
             "validate_passed": True,
             "plan_passed": True,
         }
-        # Cập nhật retries sau khi increment "eng" (total_attempts cũng tăng)
+        # Cập nhật retries sau khi increment "deploy_eng" (total_attempts cũng tăng)
         result["retries"] = state["retries"]
         result["total_attempts"] = state["total_attempts"]
 
     # MISSING_RESOURCE: resource type không tồn tại → A1 cần re-plan.
     # Ví dụ: A1 plan dùng aws_lambda_event_source_mapping nhưng thiếu aws_sqs_queue.
     elif error_type == "MISSING_RESOURCE" and not destroy_failed:
-        increment_retry(state, "arch", "MISSING_RESOURCE_DEPLOY", error_text[:200])
+        increment_retry(state, "deploy_arch", "MISSING_RESOURCE_DEPLOY", error_text[:200])
         result["fix_feedback"] = {
             "overall_passed": False,
             "error_type": "MISSING_RESOURCE",
@@ -433,7 +416,7 @@ def deployment_node(state: AgentState) -> dict:
     logger.info(
         "Agent 5: deploy_retry=%d eng_retry=%d",
         state["retries"].get("deploy", {}).get("count", 0),
-        state["retries"].get("eng", {}).get("count", 0),
+        state["retries"].get("deploy_eng", {}).get("count", 0),
     )
 
     run_dir = state.get("run_dir") or ""
@@ -457,7 +440,7 @@ def deployment_node(state: AgentState) -> dict:
                     logger.warning("Agent 5: init timeout — retry in-node")
                     continue
                 logger.error("Agent 5: init timeout (sau retry)")
-                increment_retry(state, "deploy", "INIT_TIMEOUT", "")
+                state["total_attempts"] += 1
                 return {
                     "deployment_result": _deploy_result(
                         False, "INFRASTRUCTURE",
@@ -472,7 +455,7 @@ def deployment_node(state: AgentState) -> dict:
                     logger.warning("Agent 5: init failed — retry in-node")
                     continue
                 logger.error("Agent 5: init FAILED (sau retry)")
-                increment_retry(state, "deploy", "INIT_FAILED", init.stderr[:200] if init.stderr else "")
+                state["total_attempts"] += 1
                 return {
                     "deployment_result": _deploy_result(
                         False, "INFRASTRUCTURE",
@@ -586,19 +569,15 @@ def route_after_deployment(state: AgentState) -> str:
     if error_type == "INFRASTRUCTURE":
         return "requires_human"
 
-    # LOGIC: HCL code logic sai → A3 patch.
-    # Dùng "eng" counter (shared với A4 SYNTAX/LOGIC) để tổng budget A3 không vượt _MAX_DEPLOY_ENG_RETRY.
     if error_type == "LOGIC":
-        can_retry, reason = check_retry_budget(state, "eng", max_retries=_MAX_DEPLOY_ENG_RETRY)
+        can_retry, reason = check_retry_budget(state, "deploy_eng", max_retries=MAX_DEPLOY_ENG_RETRY)
         if can_retry:
             return "engineering"
         logger.info("Agent 5: %s — route requires_human", reason)
         return "requires_human"
 
-    # MISSING_RESOURCE: resource type không tồn tại → A1 re-plan.
-    # Dùng "arch" counter (shared với A4 MISSING_RESOURCE) để tổng budget A1 không vượt _MAX_DEPLOY_ARCH_RETRY.
     if error_type == "MISSING_RESOURCE":
-        can_retry, reason = check_retry_budget(state, "arch", max_retries=_MAX_DEPLOY_ARCH_RETRY)
+        can_retry, reason = check_retry_budget(state, "deploy_arch", max_retries=MAX_DEPLOY_ARCH_RETRY)
         if can_retry:
             return "architecture"
         logger.info("Agent 5: %s — route requires_human", reason)

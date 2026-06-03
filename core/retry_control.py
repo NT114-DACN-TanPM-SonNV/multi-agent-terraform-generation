@@ -1,48 +1,66 @@
 """Tập trung quản lý retry budget cho toàn pipeline.
 
-Thay thế 7 counter độc lập (arch_retry_count, eng_retry_count, sec_retry_count,
-total_retry_count, deploy_retry_count, deploy_eng_retry_count, deploy_arch_retry_count)
-bằng 1 dict duy nhất: retries[agent] → RetryTracker.
+A4 (Validation) và A5 (Deployment) đều có thể route về A3 hoặc A1.
+Hai agent có counter RIÊNG — lỗi A5 là lớp mới (apply-time) không liên quan
+lỗi A4 đã xử lý, nên A5 luôn có đủ budget dù A4 đã dùng hết.
 
-Lợi ích:
-  - 1 source of truth (không double-count)
-  - Dễ maintain (thay max budget 1 chỗ)
-  - Dễ thêm agent mới
-  - Rõ ràng error history per agent
+Keys trong retries dict:
+  val_eng     — A4 → A3 (SYNTAX/LOGIC/SECURITY)
+  val_arch    — A4 → A1 (MISSING_RESOURCE)
+  deploy_eng  — A5 → A3 (LOGIC_DEPLOY)
+  deploy_arch — A5 → A1 (MISSING_RESOURCE_DEPLOY)
+  sec         — security gate trong A4 (best-effort khi hết)
 """
 from dataclasses import dataclass, field
 
 from core.state import AgentState, RetryTracker
 
+# ── Retry budgets — single source of truth ────────────────────────────────────
+MAX_TOTAL_RETRY       = 5  # global backstop — pipeline dừng hẳn sau 5 lần fail tổng
+MAX_VAL_ENG_RETRY     = 3  # A4 → A3: nhiều hơn A5 vì validate rẻ hơn apply
+MAX_VAL_ARCH_RETRY    = 2  # A4 → A1: re-plan ít thôi, thường fix trong 1-2 lần
+MAX_VAL_SEC_RETRY     = 2  # security gate — hết → best-effort (không block deploy)
+MAX_DEPLOY_ENG_RETRY  = 2  # A5 → A3: ít hơn A4 vì mỗi lần apply tốn tiền AWS
+MAX_DEPLOY_ARCH_RETRY = 2  # A5 → A1: độc lập val_arch
+
+# Template tracker rỗng — dùng khi agent chưa có entry trong retries dict.
+# Không dùng RetryTracker() vì TypedDict() trả {} không có keys → KeyError khi đọc.
+_BLANK_TRACKER: dict = {
+    "count": 0,
+    "last_error_type": "",
+    "last_error_details": "",
+    "error_history": [],
+}
+
 
 def increment_retry(
     state: AgentState,
-    agent: str,  # "arch", "eng", "sec", "deploy"
+    agent: str,
     error_type: str,
     error_details: str = "",
 ) -> None:
-    """Tăng retry counter cho một agent.
+    """Tăng retry counter cho agent, tạo dict mới thay vì mutate in-place.
 
-    Args:
-        state: AgentState
-        agent: "arch" (A1), "eng" (A3), "sec" (A2), "deploy" (A5)
-        error_type: loại lỗi (MISSING_RESOURCE, SYNTAX, LOGIC, SECURITY, TRANSIENT, etc.)
-        error_details: mô tả lỗi (debug)
+    Tại sao không mutate?
+    LangGraph dựa vào node trả update dict để merge vào state. Nếu mutate nested
+    dict trực tiếp, LangGraph structural sharing (checkpointing) có thể đọc
+    giá trị cũ. Tạo dict mới đảm bảo node trả giá trị đúng khi return state.
     """
-    if agent not in state["retries"]:
-        state["retries"][agent] = RetryTracker()
-
-    tracker = state["retries"][agent]
-    tracker["count"] += 1
-    tracker["last_error_type"] = error_type
-    tracker["last_error_details"] = error_details
-    tracker["error_history"].append(error_type)
-
-    # Giữ 5 lỗi gần nhất (để detect oscillation)
-    if len(tracker["error_history"]) > 5:
-        tracker["error_history"].pop(0)
-
-    state["total_attempts"] += 1
+    old = state["retries"].get(agent) or _BLANK_TRACKER
+    history = list(old["error_history"])  # copy để tránh mutate list cũ
+    history.append(error_type)
+    if len(history) > 5:
+        history.pop(0)  # giữ 5 lỗi gần nhất cho oscillation detection
+    state["retries"] = {
+        **state["retries"],
+        agent: {
+            "count": old["count"] + 1,
+            "last_error_type": error_type,
+            "last_error_details": error_details,
+            "error_history": history,
+        },
+    }
+    state["total_attempts"] = state["total_attempts"] + 1
 
 
 def check_retry_budget(
@@ -52,23 +70,18 @@ def check_retry_budget(
 ) -> tuple[bool, str]:
     """Kiểm tra agent còn retry budget không.
 
+    Luôn trả True nếu agent chưa có entry (chưa retry lần nào).
+
     Returns:
-        (can_retry: bool, reason: str)
-        - Nếu can_retry=False, reason mô tả tại sao hết budget
+        (can_retry, reason) — reason mô tả lý do khi can_retry=False
     """
-    if agent not in state["retries"]:
+    tracker = state["retries"].get(agent)
+    if not tracker:
         return True, ""
 
-    tracker = state["retries"][agent]
     count = tracker["count"]
-
-    # Agent budget: "arch" max 2, "eng" max 3, "sec" max 2, "deploy" max 2
     if count >= max_retries:
         return False, f"{agent} đã retry {count}/{max_retries} lần"
-
-    # Global safety: tối đa 20 attempts toàn pipeline
-    if state["total_attempts"] >= 20:
-        return False, f"Toàn pipeline đã attempt {state['total_attempts']}/20"
 
     return True, ""
 
@@ -78,40 +91,54 @@ def detect_oscillation(
     agent: str,
     current_error_type: str,
 ) -> bool:
-    """Phát hiện oscillation (lặp lại lỗi) → nên dừng.
+    """Phát hiện oscillation — agent đang sửa nhưng lỗi vẫn lặp lại theo pattern.
 
-    Kiểm tra các pattern:
-      - 3 lỗi cùng loại liên tiếp → oscillation
-      - Xoay vòng 2 loại (A→B→A→B) → oscillation
-      - Xoay vòng 3 loại (A→B→C→A→B) → oscillation
+    Gọi SAU increment_retry, nên current_error_type đã nằm ở cuối history[-1].
+
+    3 patterns được kiểm:
+
+    Pattern 1 — cùng lỗi 3 lần: [A, A, A]
+      history[-3:] == [current, current, current]
+
+    Pattern 2 — xoay vòng 2 loại: [A, B, A, B]
+      current = B → B ở vị trí [-1] và [-3]; A ở [-2] và [-4]
+      Điều kiện: history[-3] == history[-1] == B và history[-4] == history[-2] != B
+
+    Pattern 3 — xoay vòng 3 loại: [A, B, C, A, B]
+      current = B → B xuất hiện lần trước ở [-4]; 5 phần tử gần nhất có đúng 3 loại
+      Điều kiện: history[-4] == current và len(set(history[-5:])) == 3
+
+    Trả False nếu history chưa đủ dài để đánh giá.
     """
-    tracker = state["retries"][agent]
+    tracker = state["retries"].get(agent)
+    if not tracker:
+        return False
     history = tracker["error_history"]
 
     if len(history) < 3:
         return False
 
-    # Pattern 1: Cùng loại lỗi 3 lần liên tiếp
+    # Pattern 1: A→A→A
     if history[-3:] == [current_error_type] * 3:
         return True
 
-    # Pattern 2: Xoay vòng 2 loại (A→B→A→B)
+    # Pattern 2: A→B→A→B (B = current, ở vị trí [-1] và [-3])
     if len(history) >= 4:
-        if (history[-4] == history[-2] == current_error_type and
-            history[-3] != current_error_type and history[-1] != current_error_type):
+        if (history[-3] == history[-1] == current_error_type and
+                history[-4] == history[-2] and history[-4] != current_error_type):
             return True
 
-    # Pattern 3: Xoay vòng 3 loại (A→B→C→A→B)
+    # Pattern 3: A→B→C→A→B (B = current, xuất hiện cách 3 bước ở [-4])
     if len(history) >= 5:
-        if (history[-5] == history[-2] == current_error_type and
-            len(set(history[-5:])) == 3):
+        if (history[-4] == current_error_type and
+                len(set(history[-5:])) == 3):
             return True
 
     return False
 
 
 def get_retry_summary(state: AgentState) -> dict:
-    """Trả summary retry state để log/debug."""
+    """Trả summary retry state — dùng cho logging/debug."""
     return {
         agent: {
             "count": tracker["count"],

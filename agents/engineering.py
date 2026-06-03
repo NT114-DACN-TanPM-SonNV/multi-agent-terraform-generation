@@ -18,7 +18,7 @@ Input: state["infrastructure_plan"], state["security_profile"], optional state["
 Output: state["generated_code"] (HCL string) hoặc error
 
 Retry logic:
-  - retries["eng"] max 3 (từ A4 SYNTAX/LOGIC/SECURITY + A5 LOGIC)
+  - retries["val_eng"] max 3 (từ A4) + retries["deploy_eng"] max 2 (từ A5) — độc lập
   - Khi hết budget → requires_human
   - Oscillation prevention: eng_error_history giữ 2 fix gần nhất để LLM không lặp lỗi cũ
 
@@ -31,34 +31,17 @@ Incremental patching (khi nhận fix_instruction từ A4/A5):
 import json
 import logging
 import re
-from pathlib import Path
 
 from core.state import AgentState
 from core.llm import call_llm
 from core.errors import make_fail
 from core.parsers import strip_code_block
+from core.catalog import get_check_names
 from prompts.engineering import SYSTEM_PROMPT as _SYSTEM_PROMPT, USER_TEMPLATE as _USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
-_CATALOG_FILE = Path(__file__).parent.parent / "core" / "catalog.json"
-
-
-def _load_check_names() -> dict[str, str]:
-    try:
-        data = json.loads(_CATALOG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    names: dict[str, str] = {}
-    for checks in data.values():
-        for c in checks:
-            cid = c.get("id", "")
-            if cid and cid not in names:
-                names[cid] = c.get("name", "")
-    return names
-
-
-_CKV_NAME: dict[str, str] = _load_check_names()
+_CKV_NAME: dict[str, str] = get_check_names()
 
 # Xóa <plan>...</plan> tags từ LLM output.
 # Reasoning model (deepseek-v4-pro) đôi khi wrap chain-of-thought trong <plan> tags
@@ -192,7 +175,7 @@ def engineering_node(state: AgentState) -> dict:
         body = _clean_hcl(raw)
         if 'resource "' not in body:
             return make_fail(
-                "SYNTAX", "engineering",
+                "INFRASTRUCTURE", None,
                 f"Engineering agent không sinh được resource block (sau retry). Raw: {raw[:300]}",
             )
 

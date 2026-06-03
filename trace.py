@@ -45,7 +45,15 @@ for _n in ("httpx", "httpcore", "openai", "botocore", "boto3", "urllib3",
            "langgraph", "langchain"):
     logging.getLogger(_n).setLevel(logging.ERROR)
 
-from graph import build_initial_state, RECURSION_LIMIT, _MAX_ARCH_RETRY
+from graph import build_initial_state, RECURSION_LIMIT
+from core.retry_control import (
+    MAX_VAL_ARCH_RETRY, MAX_DEPLOY_ARCH_RETRY,
+    MAX_VAL_ENG_RETRY,  MAX_DEPLOY_ENG_RETRY,
+    MAX_VAL_SEC_RETRY,
+)
+_MAX_ARCH_RETRY = MAX_VAL_ARCH_RETRY + MAX_DEPLOY_ARCH_RETRY  # 4 tổng 2 phase
+_MAX_ENG_RETRY  = MAX_VAL_ENG_RETRY  + MAX_DEPLOY_ENG_RETRY   # 5 tổng 2 phase
+_MAX_SEC_RETRY  = MAX_VAL_SEC_RETRY                            # 2
 from evaluate import _select_graph
 
 
@@ -130,18 +138,23 @@ _AGENT_ROLE = {
         "  Nếu có fix_instruction từ vòng retry trước, A3 chỉ sửa đúng phần đó, giữ nguyên phần còn lại."
     ),
     "validation": (
-        "Kiểm tra HCL sinh bởi A3 qua 3 tầng độc lập:\n"
-        "  1. terraform validate   — cú pháp HCL có đúng không?\n"
-        "  2. terraform plan       — AWS provider có chấp nhận config này không?\n"
-        "  3. Checkov security gate — các CKV IDs mà A2 đã chọn có pass không?\n"
-        "     Scan trên plan JSON (terraform show -json) để chính xác hơn source scan.\n"
+        "Kiểm tra HCL sinh bởi A3 qua 4 bước tuần tự (bước sau chỉ chạy nếu bước trước pass):\n"
+        "  1. terraform init     — tải AWS provider plugin\n"
+        "  2. terraform validate — cú pháp HCL có đúng không?\n"
+        "  3. terraform plan     — AWS provider có chấp nhận config này không?\n"
+        "  4. Checkov gate       — các CKV IDs mà A2 đã chọn có pass không?\n"
+        "     (scan trên plan JSON từ terraform show -json — chính xác hơn source scan)\n"
         "  Nếu fail: phân loại lỗi, sinh fix_instruction, route về agent phù hợp."
     ),
     "deployment": (
-        "Chạy terraform apply để tạo resource thật trên AWS.\n"
-        "  Nếu fail: kiểm tra partial apply (terraform state list), destroy nếu dirty,\n"
-        "  phân loại lỗi (TRANSIENT/FIXABLE/MISSING_RESOURCE/UNKNOWN) rồi route.\n"
-        "  Nếu auto_destroy=True (chạy trong eval): destroy ngay sau apply thành công."
+        "Chạy terraform init + terraform apply để tạo resource thật trên AWS.\n"
+        "  Nếu apply fail: kiểm tra partial apply (terraform state list), destroy nếu dirty,\n"
+        "  phân loại lỗi rồi route:\n"
+        "    TRANSIENT        → retry A5 (network/throttle tạm thời)\n"
+        "    LOGIC            → A3 fix code rồi apply lại\n"
+        "    MISSING_RESOURCE → A1 re-plan (AWS resource phụ thuộc thiếu)\n"
+        "    OTHER            → requires_human (lỗi không xác định hoặc hết budget)\n"
+        "  Nếu auto_destroy=True (eval mode): terraform destroy ngay sau apply thành công."
     ),
     "requires_human": (
         "Pipeline không thể tự giải quyết — hết budget retry hoặc gặp lỗi không thể tự sửa.\n"
@@ -230,12 +243,20 @@ def _arrow_next(src: str, dst: str, explanation: str) -> None:
 # ── Retry counter helper ─────────────────────────────────────────────────────
 
 def _rc(state: dict, key: str) -> int:
-    """Đọc retry counter từ state mới (retries dict + total_attempts).
+    """Đọc retry counter từ state.
     key: 'total' | 'eng' | 'arch' | 'sec' | 'deploy'
+    eng/arch aggregate cả val_ và deploy_ phase.
     """
     if key == "total":
         return state.get("total_attempts", 0)
-    return (state.get("retries") or {}).get(key, {}).get("count", 0)
+    r = state.get("retries") or {}
+    if key == "eng":
+        return r.get("val_eng", {}).get("count", 0) + r.get("deploy_eng", {}).get("count", 0)
+    if key == "arch":
+        return r.get("val_arch", {}).get("count", 0) + r.get("deploy_arch", {}).get("count", 0)
+    if key == "deploy":
+        return r.get("deploy_eng", {}).get("count", 0) + r.get("deploy_arch", {}).get("count", 0)
+    return r.get(key, {}).get("count", 0)
 
 
 # ── Per-agent commentary ──────────────────────────────────────────────────────
@@ -250,19 +271,18 @@ def _explain_input(node: str, state: dict) -> None:
             print()
             _note("→ đây là lần retry: A1 nhận thêm fix_instruction để biết cần re-plan như thế nào")
             _item("state['fix_feedback']['fix_instruction']", fb["fix_instruction"][:300], color=yellow)
-            _item("retries['arch']['count']", _rc(state, "arch"), color=yellow)
+            _item("retries[val_arch+deploy_arch]['count']", _rc(state, "arch"), color=yellow)
         else:
             _note("→ lần chạy đầu tiên, chưa có fix_instruction nào")
 
     elif node == "security":
         plan = state.get("infrastructure_plan") or {}
         resources = plan.get("resources", [])
-        _note("→ A2 không đọc prompt trực tiếp, chỉ đọc infrastructure_plan mà A1 đã phân tích")
+        _note("→ A2 đọc cả prompt lẫn infrastructure_plan để hiểu intent + biết resource type")
+        _item("state['prompt']", state.get("prompt", "")[:120], color=dim)
+        print()
         _item("state['infrastructure_plan']['resources']",
               f"{len(resources)} resources: " + ", ".join(f"{r.get('type')}.{r.get('name')}" for r in resources))
-        print()
-        _note("→ A2 cũng đọc prompt để hiểu intent (e.g. 'public API' → cần public access)")
-        _item("state['prompt']", state.get("prompt", "")[:120], color=dim)
 
     elif node == "engineering":
         plan = state.get("infrastructure_plan") or {}
@@ -295,7 +315,7 @@ def _explain_input(node: str, state: dict) -> None:
             print()
             _note("→ đây là lần retry: A3 nhận fix_instruction, chỉ sửa phần đó, giữ nguyên phần còn lại")
             _item("state['fix_feedback']['fix_instruction']", fb["fix_instruction"][:300], color=yellow)
-            _item("retries['eng']['count']", _rc(state, "eng"), color=yellow)
+            _item("retries[val_eng+deploy_eng]['count']", _rc(state, "eng"), color=yellow)
 
     elif node == "validation":
         code = state.get("generated_code", "")
@@ -323,7 +343,7 @@ def _explain_input(node: str, state: dict) -> None:
         _note("→ auto_destroy=True trong eval mode: destroy ngay sau apply để không tốn tiền AWS")
         deploy_r = _rc(state, "deploy")
         if deploy_r > 0:
-            _item("retries['deploy']['count']", deploy_r, color=yellow)
+            _item("retries[deploy_eng+deploy_arch]['count']", deploy_r, color=yellow)
         fb = state.get("fix_feedback") or {}
         if fb.get("root_cause") == "engineering" and fb.get("fix_instruction"):
             print()
@@ -519,7 +539,7 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
                 _arrow_next(node, "architecture",
                             f"plan rỗng → re-plan, arch_retry={arch_cnt}/{_MAX_ARCH_RETRY}")
             else:
-                _note(f"   hết budget arch_retry → dừng, không thể tự sửa")
+                _note("   hết budget arch_retry → dừng, không thể tự sửa")
                 _arrow_next(node, "requires_human",
                             f"hết budget arch_retry ({arch_cnt}/{_MAX_ARCH_RETRY})")
         else:
@@ -540,41 +560,41 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
                 _note("→ overall_passed=True dù có unmet_checks")
                 _note("   hết sec retry budget → A4 chấp nhận best-effort, không block deploy")
             else:
-                _note("→ overall_passed=True: cả 3 tầng kiểm tra đều pass")
+                _note("→ overall_passed=True: cả 4 bước kiểm tra đều pass")
             _arrow_next(node, "deployment", "HCL hợp lệ và an toàn → deploy thật lên AWS")
         else:
             _note(f"→ overall_passed=False, A4 cần route về agent phù hợp để sửa")
             _note(f"   error_type={yellow(et or '?')}  root_cause={yellow(rc or '?')}")
-            _note(f"   budget: total={total_r}/5  eng={eng_r}/3  sec={sec_r}/2  arch={arch_r}/2")
+            _note(f"   budget: total={total_r}/5  eng={eng_r}/{_MAX_ENG_RETRY}  sec={sec_r}/{_MAX_SEC_RETRY}  arch={arch_r}/{_MAX_ARCH_RETRY}")
             print()
             if total_r >= 5:
                 _note("→ total_attempts >= 5: backstop global — dừng để không loop vô hạn")
                 _arrow_next(node, "requires_human", f"backstop total_retry={total_r}/5")
             elif et == "MISSING_RESOURCE":
-                if arch_r <= 2:
+                if arch_r < _MAX_ARCH_RETRY:
                     _note("→ MISSING_RESOURCE: plan thiếu resource → A1 phải re-plan")
                     _note("   (không phải lỗi code A3, không ích gì khi gửi fix về A3)")
                     _arrow_next(node, "architecture",
-                                f"plan thiếu resource, arch_retry={arch_r}/2")
+                                f"plan thiếu resource, arch_retry={arch_r}/{_MAX_ARCH_RETRY}")
                 else:
-                    _arrow_next(node, "requires_human", f"hết budget arch_retry ({arch_r}/2)")
+                    _arrow_next(node, "requires_human", f"hết budget arch_retry ({arch_r}/{_MAX_ARCH_RETRY})")
             elif et == "SECURITY":
-                if sec_r <= 2:
+                if sec_r < _MAX_SEC_RETRY:
                     _note("→ SECURITY: Checkov fail → A3 sửa code theo fix_instruction")
                     _note("   root_cause='engineering' vì sửa attribute trên resource sẵn có")
                     _arrow_next(node, "engineering",
-                                f"Checkov fail, A3 thêm/sửa security attributes, sec_retry={sec_r}/2")
+                                f"Checkov fail, A3 thêm/sửa security attributes, sec_retry={sec_r}/{_MAX_SEC_RETRY}")
                 else:
                     _note("→ hết budget sec_retry → best-effort accept, deploy tiếp")
                     _note("   unmet_checks sẽ được ghi lại để tracking, không block")
-                    _arrow_next(node, "deployment", f"best-effort security, sec_retry hết ({sec_r}/2)")
+                    _arrow_next(node, "deployment", f"best-effort security, sec_retry hết ({sec_r}/{_MAX_SEC_RETRY})")
             elif et in ("SYNTAX", "LOGIC"):
-                if eng_r <= 3:
+                if eng_r < _MAX_ENG_RETRY:
                     _note(f"→ {et}: lỗi trong HCL A3 sinh → gửi fix_instruction về A3")
                     _arrow_next(node, "engineering",
-                                f"lỗi {et} trong HCL, eng_retry={eng_r}/3")
+                                f"lỗi {et} trong HCL, eng_retry={eng_r}/{_MAX_ENG_RETRY}")
                 else:
-                    _arrow_next(node, "requires_human", f"hết budget eng_retry ({eng_r}/3)")
+                    _arrow_next(node, "requires_human", f"hết budget eng_retry ({eng_r}/{_MAX_ENG_RETRY})")
             elif et == "INFRASTRUCTURE":
                 _note("→ INFRASTRUCTURE: terraform init/plan timeout — không phải lỗi code")
                 _arrow_next(node, "requires_human", "terraform infra timeout, không tự sửa được")

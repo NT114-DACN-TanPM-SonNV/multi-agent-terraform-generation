@@ -2,53 +2,81 @@ from typing import TypedDict
 
 
 class RetryTracker(TypedDict):
-    """Tracker retry cho một agent."""
-    count: int
-    last_error_type: str
-    last_error_details: str
-    error_history: list  # list[str] — giữ 5 lỗi gần nhất
+    """Tracker retry cho một agent — counter + lịch sử lỗi."""
+    count: int              # số lần đã retry
+    last_error_type: str    # loại lỗi cuối (debug)
+    last_error_details: str # mô tả lỗi cuối (debug)
+    error_history: list     # list[str] — 5 lỗi gần nhất, dùng cho oscillation detection
 
 
 class AgentState(TypedDict):
-    # Input — không thay đổi trong suốt pipeline
-    prompt: str
+    """Shared memory duy nhất chảy qua toàn pipeline.
 
-    # Cấu hình môi trường — đọc từ env vars khi khởi tạo graph
-    terraform_plan_timeout: int
-    auto_destroy: bool          # True trong eval/batch — destroy ngay sau apply thành công
+    LangGraph truyền state qua mọi node. Node đọc các field cần thiết,
+    rồi trả dict update — LangGraph merge vào state trước khi gọi node tiếp theo.
+    Không ai giữ reference riêng; state là single source of truth.
+    """
 
-    # Agent 1 — {"resources": [...], "data_sources": [...]}
-    # attributes: primitive → flat attr, nested dict → HCL block, "REF:..." → reference
+    # ── Input (bất biến suốt pipeline) ────────────────────────────────────────
+    prompt: str  # user request gốc, không bao giờ thay đổi
+
+    # ── Cấu hình chạy ─────────────────────────────────────────────────────────
+    terraform_plan_timeout: int  # giây — đọc từ TF_PLAN_TIMEOUT env
+    auto_destroy: bool           # True trong eval mode: destroy ngay sau apply
+
+    # ── Output từng agent ─────────────────────────────────────────────────────
+    # A1: JSON plan mô tả AWS resources cần tạo
+    # Schema: {"resources": [{"type", "name", "attributes", "blocks"}],
+    #          "data_sources": [...]}
+    # attributes = HCL arg = value; blocks = HCL block {} (không có =)
+    # "REF:type.name.attr" = reference tới resource khác trong plan
     infrastructure_plan: dict
 
-    # Agent 2 — {"type.name": {"posture": "minimal|standard|strict", "description": ...}}
-    # LLM phán posture theo intent; description text đưa A3 apply best practices.
-    # Security grading độc lập ở score.py (full Checkov, không qua A2).
+    # A2: CKV IDs cần enforce, grounded bằng catalog menu per resource
+    # Schema: {"aws_s3_bucket.main": {"type": "aws_s3_bucket", "checks": ["CKV_AWS_19"]}}
+    # checks=[] nghĩa là A2 không chọn check nào cho resource đó (intent hoặc lỗi)
     security_profile: dict
 
-    # Agent 3
+    # A3: HCL Terraform hoàn chỉnh (terraform{} + provider{} + resource{} blocks)
     generated_code: str
 
-    # Agent 4
+    # A4: kết quả validate/plan/checkov + routing hint cho node tiếp theo
+    # Schema: {"overall_passed": bool, "error_type": str|None,
+    #          "root_cause": "engineering"|"architecture"|None,
+    #          "fix_instruction": str|None, "checkov": {...},
+    #          "unmet_checks": [...], "phantom_checks": [...],
+    #          "validate_passed": bool, "plan_passed": bool}
+    # A5 ghi đè fix_feedback khi cần route lại A3/A1 sau apply fail.
     fix_feedback: dict
 
-    # ✅ Retry tracking — 1 dict tập trung thay vì 7 counter độc lập
-    # Keys: "arch" (A1), "eng" (A3), "sec" (A2), "deploy" (A5)
-    # Thay thế: arch_retry_count, eng_retry_count, sec_retry_count, total_retry_count,
-    #          deploy_retry_count, deploy_eng_retry_count, deploy_arch_retry_count
-    retries: dict[str, RetryTracker]
-    total_attempts: int         # Global safety: max 20 attempts toàn pipeline
-
-    # Agent 5
+    # A5: kết quả terraform apply
+    # Schema: {"success": bool, "error_type": str|None,
+    #          "resources_created": [...], "apply_raw_error": str,
+    #          "partial_apply_destroyed": bool, "destroy_failed": bool}
     deployment_result: dict
 
-    # Oscillation prevention — lịch sử fix_instruction A1/A3 đã nhận từ A4/A5
-    arch_error_history: list
-    eng_error_history: list
+    # ── Retry tracking ─────────────────────────────────────────────────────────
+    # A4 và A5 có counter độc lập — lỗi A5 là lớp mới (apply-time), không liên quan A4.
+    # val_eng:     A4 → A3 (SYNTAX/LOGIC/SECURITY),  cap = MAX_VAL_ENG_RETRY
+    # val_arch:    A4 → A1 (MISSING_RESOURCE),         cap = MAX_VAL_ARCH_RETRY
+    # deploy_eng:  A5 → A3 (LOGIC_DEPLOY),             cap = MAX_DEPLOY_ENG_RETRY
+    # deploy_arch: A5 → A1 (MISSING_RESOURCE_DEPLOY),  cap = MAX_DEPLOY_ARCH_RETRY
+    # sec:         security gate A4, hết → best-effort deploy (không block)
+    retries: dict[str, RetryTracker]
+    total_attempts: int  # global backstop — max MAX_TOTAL_RETRY=5, tăng mỗi lần fail bất kỳ
 
-    # Audit log
-    routing_log: list
+    # ── Oscillation prevention ─────────────────────────────────────────────────
+    # Lưu 2 fix_instruction gần nhất gửi tới A1/A3 — đút vào prompt để agent
+    # biết "đừng lặp lại sai lầm này". Khác retries[x].error_history: cái đó
+    # là chuỗi error_type (để phát hiện pattern), cái này là fix text đầy đủ.
+    arch_error_history: list  # list[{"fix_instruction": str}]
+    eng_error_history: list   # list[{"fix_instruction": str}]
 
-    # Per-run working directory — set by evaluate.py (tmp/row_<idx>), dùng bởi A4/A5
-    # cho structured dirs. Optional: nếu không set, A4/A5 fallback về temp dir.
+    # ── Audit ──────────────────────────────────────────────────────────────────
+    routing_log: list  # list[{"round", "error_type", "root_cause", "fix_instruction", "predicted_route"}]
+
+    # ── Eval infra ─────────────────────────────────────────────────────────────
+    # evaluate.py set trước khi invoke; "" = dùng tempdir tự động.
+    # A4 và A5 dùng chung thư mục này để chia sẻ stub files (Lambda zip, etc.)
+    # mà không cần copy lại giữa các agent.
     run_dir: str
