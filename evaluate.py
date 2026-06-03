@@ -17,9 +17,14 @@ import csv
 import json
 import logging
 import os
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import re
 import shutil
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -277,7 +282,6 @@ def _extract_results(
     if no_secu:
         secu_result = {
             "ok": True, "elapsed_s": 0, "skipped": True,
-            "ckv_resource_count": 0, "ckv_total": 0, "ckv_ids": {},
         }
     elif "security" in timings:
         secu_result = {
