@@ -1,5 +1,5 @@
 ﻿IaC LLM Evaluation - Concise Summary,,,,,
-"Gộp từ 3 tab: Paper Summary, Metric Formulas, Your Eval Pipeline",,,,,
+
 1. Research & benchmarks,,,,,
 Paper,Dataset / Benchmark,IaC format,Evaluates,Pipeline / metrics,Key result / source
 IaC-Eval: A Code Generation Benchmark for Cloud Infrastructure-as-Code Programs,458 human-curated AWS scenarios,Terraform HCL,"Intent correctness: resources, dependencies, attributes","Prompt -> LLM -> terraform plan -> dependency graph -> OPA/Rego intent check; pass@k, intent pass rate",GPT-4 pass@1 about 19.36%. Source: https://openreview.net/forum?id=7TCK0aBL1C
