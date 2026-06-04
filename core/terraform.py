@@ -3,12 +3,15 @@
 _TF_ENV đảm bảo mọi subprocess đều dùng plugin cache — tránh download
 provider hàng trăm lần khi chạy benchmark.
 """
+import base64
 import io
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -19,19 +22,50 @@ from pathlib import Path
 _TF_CACHE_DIR = Path(__file__).parent.parent / ".tf_plugin_cache"
 _TF_CACHE_DIR.mkdir(exist_ok=True)
 
-# Env dùng chung cho mọi subprocess terraform — inject cache dir.
-# MAY_BREAK_DEPENDENCY_LOCK_FILE: cho phép dùng plugin cache khi init trong
-# thư mục chưa có .terraform.lock.hcl (tránh lỗi checksum mismatch ngẫu nhiên).
-_TF_ENV = {
-    **os.environ,
-    "TF_PLUGIN_CACHE_DIR": str(_TF_CACHE_DIR),
-    "TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE": "true",
-}
+# Env dùng chung cho mọi subprocess terraform.
+# TF_PLUGIN_CACHE_DIR bị bỏ — dùng -plugin-dir trong tf_init_cmd() thay thế.
+# TF_PLUGIN_CACHE_DIR khiến Terraform tạo directory junction từ working dir
+# vào cache; trên Windows junction cũ bị giữ handle → sequential runs fail
+# với "failed to remove existing ...cache..." ngay cả sau khi cleanup .terraform.
+# -plugin-dir: Terraform đọc provider trực tiếp, không tạo junction → không conflict.
+_TF_ENV = {**os.environ}
 
 # Công cụ bắt buộc cho PIPELINE (generate→validate→deploy). `opa` KHÔNG ở đây vì
 # pipeline không dùng OPA — nó chỉ cần cho semantic eval (core/rego_eval.py),
 # nơi tự kiểm tra opa riêng.
 _REQUIRED_TOOLS = ("checkov", "terraform")
+
+
+def _sanitize_cache() -> None:
+    """Xóa thư mục cache rỗng do shutil.rmtree follow junction để lại.
+
+    Python 3.11 Windows: shutil.rmtree FOLLOW directory junction và xóa nội dung
+    của TARGET (cache). Cache dir còn đó nhưng rỗng → Terraform không remove được
+    dir rỗng đó khi cần reinstall → 'failed to remove existing' error.
+
+    Fix: walk bottom-up, rmdir các dir rỗng → Terraform thấy provider không có
+    trong cache → download lại bình thường.
+    """
+    if not _TF_CACHE_DIR.exists():
+        return
+    for p in sorted(_TF_CACHE_DIR.rglob("*"), reverse=True):
+        if p.is_dir() and not any(p.iterdir()):
+            try:
+                p.rmdir()
+            except OSError:
+                pass
+
+
+def tf_init_cmd() -> list[str]:
+    """terraform init command.
+
+    Sanitize cache trước, rồi dùng -plugin-dir nếu cache có provider binary thật.
+    Fallback plain init khi cache rỗng (lần đầu hoặc sau khi sanitize xóa hết).
+    """
+    _sanitize_cache()
+    if any(_TF_CACHE_DIR.rglob("terraform-provider-*")):
+        return ["terraform", "init", "-plugin-dir", str(_TF_CACHE_DIR), "-no-color"]
+    return ["terraform", "init", "-no-color"]
 
 
 def check_required_tools() -> None:
@@ -44,39 +78,98 @@ def check_required_tools() -> None:
         raise RuntimeError(f"Công cụ chưa được cài: {', '.join(missing)}")
 
 
-_STUBS_DIR = Path(__file__).parent / "stubs"
-
-# Các pattern HCL có thể reference file local — capture group 1 là path
+# Các pattern HCL có thể reference file local — mỗi alternative có đúng 1 capture group.
+# Thứ tự quan trọng: pattern cụ thể (templatefile) trước pattern chung (file) để
+# finditer không bắt "file" bên trong "templatefile" trước khi group templatefile thử.
 _LOCAL_FILE_PATTERNS = re.compile(
     r'(?:'
-    r'filename\s*=\s*"([^"]+)"'                  # filename = "..."
-    r'|source_file\s*=\s*"([^"]+)"'              # source_file = "..."
-    r'|source_dir\s*=\s*"([^"]+)"'               # source_dir = "..." (archive_file dir)
-    r'|source\s*=\s*"(\.{1,2}/[^"]+)"'           # source = "./..." or "../..." (local only)
-    r'|(?:template|config)file?\s*=\s*"([^"]+)"' # template/config = "..."
-    r'|file\s*\(\s*"([^"]+)"\s*\)'               # file("...")
-    r'|templatefile\s*\(\s*"([^"]+)"'            # templatefile("...", ...)
+    r'filename\s*=\s*"([^"]+)"'                   # filename = "..."  (archive_file, lambda)
+    r'|source_file\s*=\s*"([^"]+)"'               # source_file = "..."  (archive_file)
+    r'|source_dir\s*=\s*"([^"]+)"'                # source_dir = "..."  (archive_file dir)
+    r'|source\s*=\s*"(\.{1,2}/[^"]+)"'            # source = "./..."  (local module/file only)
+    r'|(?:template|config)file?\s*=\s*"([^"]+)"'  # templatefile/configfile = "..."
+    r'|templatefile\s*\(\s*"([^"]+)"'             # templatefile("...", vars)
+    r'|filebase64sha256\s*\(\s*"([^"]+)"\s*\)'    # filebase64sha256("...")
+    r'|filebase64\s*\(\s*"([^"]+)"\s*\)'          # filebase64("...")
+    r'|filesha(?:256|512)\s*\(\s*"([^"]+)"\s*\)'  # filesha256/filesha512("...")
+    r'|filemd5\s*\(\s*"([^"]+)"\s*\)'             # filemd5("...")
+    r'|file\s*\(\s*"([^"]+)"\s*\)'                # file("...")  — phải sau các file* cụ thể
     r')'
 )
 
+def _make_stub_pub_key() -> str:
+    """Sinh OpenSSH RSA-2048 public key với wire format hợp lệ.
+
+    Vấn đề với key giả kiểu "ssh-rsa AAAA...stub": base64 không decode ra đúng SSH wire
+    format → AWS ImportKeyPair báo InvalidKey.Format dù terraform plan đã pass.
+    Fix: xây wire format chuẩn (length-prefixed fields) rồi base64-encode.
+
+    Key này KHÔNG an toàn mặt toán học (modulus random, không phải RSA prime product)
+    nhưng đủ để qua format validation của AWS API. Dùng key thật khi deploy production.
+    """
+    key_type = b"ssh-rsa"
+    e_bytes = b'\x01\x00\x01'            # e=65537, MSB=0x01 → không cần sign byte
+    raw = os.urandom(256)
+    # MSB byte phải ≥ 0x80 để modulus đủ 2048-bit; thêm \x00 sign byte vì MSB set
+    n_bytes = b'\x00' + bytes([raw[0] | 0x80]) + raw[1:]   # 257 bytes total
+    wire = (
+        struct.pack('>I', len(key_type)) + key_type +
+        struct.pack('>I', len(e_bytes)) + e_bytes +
+        struct.pack('>I', len(n_bytes)) + n_bytes
+    )
+    return "ssh-rsa " + base64.b64encode(wire).decode() + " stub-key\n"
+
+
+# Content mặc định cho stub theo extension.
+# Extension KHÔNG có trong dict vẫn được tạo file rỗng (_create_stub_file fallback).
+# Chỉ thêm vào đây khi stub cần content cụ thể (script, key format, binary header).
 _STUB_CONTENT: dict[str, bytes | str] = {
-    ".zip": None,   # generated dynamically
-    ".py":  "def handler(event, context):\n    return {'statusCode': 200}\n",
-    ".js":  "exports.handler = async (event) => ({ statusCode: 200 });\n",
-    ".sh":  "#!/bin/bash\necho stub\n",
-    ".json": "{}\n",
-    ".yaml": "",
-    ".yml":  "",
-    ".env":  "",
-    ".conf": "",
-    ".tpl":  "",
-    ".txt":  "",
-    ".pem":  "",
-    ".pdf":  b"%PDF-1.4 stub",
-    ".csv":  "",
-    ".xml":  "",
-    ".html": "",
-    ".htm":  "",
+    # Lambda / serverless function handlers
+    ".zip":   None,   # generated dynamically by _make_stub_zip()
+    ".py":    "def handler(event, context):\n    return {'statusCode': 200}\n",
+    ".js":    "exports.handler = async (event) => ({ statusCode: 200 });\n",
+    ".ts":    "export const handler = async (event: any) => ({ statusCode: 200 });\n",
+    ".go":    "package main\nfunc main() {}\n",
+    ".rb":    "def handler(event:, context:)\n  { statusCode: 200 }\nend\n",
+    ".java":  "public class Handler {}\n",
+    # Scripts
+    ".sh":    "#!/bin/bash\necho stub\n",
+    ".bash":  "#!/bin/bash\necho stub\n",
+    ".ps1":   "Write-Output 'stub'\n",
+    ".bat":   "@echo off\necho stub\n",
+    ".cmd":   "@echo off\necho stub\n",
+    # SSH / TLS keys & certs
+    ".pub":   None,   # generated dynamically by _make_stub_pub_key() — cần SSH wire format đúng
+    ".pem":   "-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n",
+    ".crt":   "-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n",
+    ".cert":  "-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n",
+    ".cer":   "-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n",
+    ".key":   "-----BEGIN PRIVATE KEY-----\nstub\n-----END PRIVATE KEY-----\n",
+    ".ca":    "-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n",
+    # Data / config — file rỗng/minimal đủ để terraform plan đọc
+    ".json":  "{}\n",
+    ".yaml":  "",
+    ".yml":   "",
+    ".toml":  "",
+    ".env":   "",
+    ".conf":  "",
+    ".cfg":   "",
+    ".ini":   "",
+    ".properties": "",
+    # Templates
+    ".tpl":   "",
+    ".tmpl":  "",
+    ".j2":    "",
+    ".jinja": "",
+    ".jinja2": "",
+    # Text / document
+    ".txt":   "",
+    ".csv":   "",
+    ".xml":   "",
+    ".html":  "",
+    ".htm":   "",
+    ".sql":   "",
+    ".pdf":   b"%PDF-1.4 stub",
 }
 
 _STUB_ZIP_HANDLER = (
@@ -93,21 +186,30 @@ def _make_stub_zip() -> bytes:
 
 
 def _create_stub_file(path: Path, stub_zip: bytes) -> bytes | None:
-    """Tạo stub file phù hợp với extension. Trả về stub_zip bytes nếu vừa tạo."""
+    """Tạo stub file phù hợp với extension. Trả về stub_zip bytes nếu vừa tạo.
+
+    Extension không có trong _STUB_CONTENT → tạo file rỗng (fallback).
+    Terraform cần file TỒN TẠI để file()/filebase64()/... không throw; content
+    chỉ quan trọng ở apply-time khi AWS validate (key format, cert format, v.v.).
+    """
     ext = path.suffix.lower()
-    if ext not in _STUB_CONTENT and ext not in (".zip",):
-        return stub_zip  # extension không biết — bỏ qua
     path.parent.mkdir(parents=True, exist_ok=True)
     if ext == ".zip":
         if stub_zip is None:
             stub_zip = _make_stub_zip()
         path.write_bytes(stub_zip)
-    else:
-        content = _STUB_CONTENT.get(ext, "")
+    elif ext == ".pub":
+        # SSH public key cần wire format chuẩn — tạo mới mỗi lần (os.urandom modulus)
+        path.write_text(_make_stub_pub_key(), encoding="utf-8")
+    elif ext in _STUB_CONTENT:
+        content = _STUB_CONTENT[ext]
         if isinstance(content, bytes):
             path.write_bytes(content)
         else:
             path.write_text(content, encoding="utf-8")
+    else:
+        # Extension không biết — tạo file rỗng để terraform plan không fail vì thiếu file.
+        path.write_text("", encoding="utf-8")
     return stub_zip
 
 
@@ -125,11 +227,6 @@ def write_terraform_dir(tmpdir: str | Path, code: str,
     """
     d = Path(tmpdir)
     (d / "main.tf").write_text(code, encoding="utf-8")
-    if _STUBS_DIR.exists():
-        for stub in _STUBS_DIR.iterdir():
-            if stub.is_file():
-                shutil.copy2(stub, d / stub.name)
-
     fd = Path(files_dir) if files_dir else None
     if fd:
         fd.mkdir(parents=True, exist_ok=True)
@@ -178,14 +275,16 @@ def write_terraform_dir(tmpdir: str | Path, code: str,
 
 
 @contextmanager
-def terraform_workdir(run_dir: str | Path | None, subdir: str):
+def terraform_workdir(run_dir: str | Path | None, subdir: str, reuse: bool = False):
     """Context manager trả về thư mục làm việc cho terraform.
 
     Nếu run_dir được cung cấp: dùng run_dir/subdir (persistent, không xóa khi exit).
     Nếu không: tạo tempdir tạm thời (xóa khi exit).
 
-    Luôn xóa .terraform/ và .terraform.lock.hcl trước khi yield — đảm bảo terraform init
-    chạy fresh, tránh lock file từ run trước conflict với version constraint mới.
+    reuse=False (default): xóa .terraform/ và .terraform.lock.hcl trước khi yield —
+      đảm bảo terraform init chạy fresh, tránh lock file cũ conflict.
+    reuse=True: giữ nguyên .terraform/ và lock file — dùng khi A5 tái sử dụng thư mục
+      mà A4 đã init để skip re-download provider.
     Plugin cache (_TF_CACHE_DIR) vẫn giữ nguyên nên init không cần re-download.
     """
     if run_dir:
@@ -200,11 +299,22 @@ def terraform_workdir(run_dir: str | Path | None, subdir: str):
         if lock.exists():
             lock.unlink()
         if dot_tf.exists():
-            import shutil as _shutil
-            _shutil.rmtree(dot_tf, ignore_errors=True)
+            if sys.platform == "win32":
+                # shutil.rmtree silent-fails trên Windows khi .terraform/providers/
+                # chứa directory junction trỏ vào plugin cache — junction entry không
+                # bị xóa, terraform init lần sau cố remove từ cache trước khi relink
+                # → "failed to remove existing ...cache..." error.
+                # rmdir /s /q xóa junction entry đúng cách mà không follow target.
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", "/s", "/q", str(dot_tf)],
+                    capture_output=True, timeout=15,
+                )
+            else:
+                shutil.rmtree(dot_tf, ignore_errors=True)
 
     if d:
-        _clean(d)
+        if not reuse:
+            _clean(d)
         yield d
     else:
         with tempfile.TemporaryDirectory(prefix=f"tf_{subdir}_") as tmp:

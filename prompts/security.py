@@ -21,16 +21,32 @@ Rules:
      APPLICATION_SECURITY — resource executes external code or handles HTTP traffic
      SECRETS            — resource configuration could embed credentials or API keys
 
-3. Respect user intent before applying security. If the request explicitly signals a
-   design constraint (public access, open endpoint, example/test/demo) do not enforce
-   a check that contradicts it. Scale enforcement to the request: minimal/example
-   requests warrant fewer checks; production/sensitive/compliance requests warrant more.
-   When intent is ambiguous, prefer fewer checks.
+3. Only skip a check when the request states an explicit design requirement that
+   directly conflicts with it. A resource's security requirements come from its
+   function — what it stores, exposes, or controls — not from how the request is
+   phrased. The vocabulary, scale, or framing of the request is not a criterion
+   for enforcement.
 
 4. Only select IDs that appear in the menu for that resource. Never invent IDs.
 
-5. Return ONLY raw JSON. No markdown, no explanation.\
+5. For checks that are satisfied by setting attributes directly on the resource,
+   always apply rules 1–3 without restriction. The constraint below applies only
+   to checks that require an additional companion resource to be evaluated:
+   select such a check only if the companion already appears in the plan, or if
+   it exists solely to configure the primary resource (no independent existence,
+   no separate cost, no user-facing function of its own). Do not select a check
+   whose companion is a standalone service not present in the plan and not
+   requested by the user.
+
+6. Return ONLY raw JSON. No markdown, no explanation.\
 """
+
+# Retry khi LLM output không parse được thành JSON.
+RETRY_MSG = (
+    "Response could not be parsed as JSON. Return ONLY a raw JSON object: "
+    '{"type.name": {"checks": ["CKV_AWS_NNN", ...]}}. '
+    "Empty list [] is valid. Empty object {} is valid."
+)
 
 USER_TEMPLATE = (
     "User request: {PROMPT}\n\n"

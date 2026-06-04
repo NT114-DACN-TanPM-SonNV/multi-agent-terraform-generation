@@ -23,8 +23,13 @@ Chạy:
 import argparse
 import csv
 import json
+import sys
+import io
 from collections import defaultdict
 from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv
 load_dotenv()  # nạp AWS_ACCESS_KEY_ID/SECRET từ .env trước khi terraform subprocess khởi động
@@ -70,6 +75,8 @@ def _score_row(run_row: dict, gold: dict, do_rego: bool, do_checkov: bool,
         "semantic_correct": None,
         "llm_judge": None,
         "security_score": None,
+        "total_elapsed_s": run_row.get("total_elapsed_s"),
+        "resource_f1": (run_row.get("resource_match") or {}).get("f1"),
     }
 
     if do_rego and code.strip():
@@ -102,6 +109,16 @@ def _score_row(run_row: dict, gold: dict, do_rego: bool, do_checkov: bool,
     prof = secu.get("security_profile") or {}
     scored["security_selected"] = sum(len(v.get("checks", [])) for v in prof.values())
 
+    # degraded: A2 LLM hỏng → 0 check enforce KHÔNG do intent. Tách khỏi run bình thường
+    # để security_score_mean không bị nhiễu bởi lỗi hạ tầng-LLM thay vì lỗi mô hình.
+    scored["security_degraded"] = bool(val.get("security_degraded"))
+
+    # Khoảng cách intended-vs-verified security — bị best-effort PASS che giấu:
+    #   unmet   = A2 target + Checkov fail nhưng hết budget → vẫn overall_passed=True
+    #   phantom = A2 target nhưng Checkov không evaluate (thiếu companion) → không pass/fail
+    scored["security_unmet"]   = len(val.get("unmet_checks") or [])
+    scored["security_phantom"] = len(val.get("phantom_checks") or [])
+
     return scored
 
 
@@ -114,6 +131,8 @@ def _summarize_run(scored_rows: list[dict], has_deploy: bool, has_rego: bool) ->
     judge_rows = [r for r in scored_rows if r.get("llm_judge") is not None]
     judge_ok = sum(1 for r in judge_rows if r["llm_judge"] == 1)
     sec_vals = [r["security_score"] for r in scored_rows if r.get("security_score") is not None]
+    elapsed_vals = [r["total_elapsed_s"] for r in scored_rows if r.get("total_elapsed_s") is not None]
+    f1_vals = [r["resource_f1"] for r in scored_rows if r.get("resource_f1") is not None]
 
     resolved = {}
     for k in range(1, _MAX_K + 1):
@@ -131,6 +150,21 @@ def _summarize_run(scored_rows: list[dict], has_deploy: bool, has_rego: bool) ->
         "deploy_success": rate(deploy_ok, n) if has_deploy else None,
         "security_score_mean": round(sum(sec_vals) / len(sec_vals), 4) if sec_vals else None,
         "security_n": len(sec_vals),
+        # Tỷ lệ run mà A2 hỏng (LLM fail) → 0 security enforcement KHÔNG do intent.
+        # Cao = kết quả security đang bị nhiễu bởi lỗi hạ tầng, cần điều tra trước khi tin số.
+        "security_degraded_rate": rate(sum(1 for r in scored_rows if r.get("security_degraded")), n),
+        # Khoảng cách intended-vs-verified: % run "PASS" nhưng thực chưa verify đủ security.
+        #   unmet_rate   = có check fail bị best-effort bỏ qua (hết budget)
+        #   phantom_rate = có check target mà Checkov không evaluate (thiếu companion)
+        #   verified_clean_rate = PASS thật sạch: plan_valid VÀ unmet=0 VÀ phantom=0 VÀ không degraded
+        "security_unmet_rate":   rate(sum(1 for r in scored_rows if r.get("security_unmet")),   n),
+        "security_phantom_rate": rate(sum(1 for r in scored_rows if r.get("security_phantom")), n),
+        "verified_clean_rate":   rate(sum(1 for r in scored_rows
+                                          if r.get("plan_valid") and not r.get("security_unmet")
+                                          and not r.get("security_phantom")
+                                          and not r.get("security_degraded")), n),
+        "time_to_deploy_mean": round(sum(elapsed_vals) / len(elapsed_vals), 1) if elapsed_vals else None,
+        "resource_f1_mean":    round(sum(f1_vals) / len(f1_vals), 4) if f1_vals else None,
         **resolved,
     }
 
@@ -167,7 +201,7 @@ def main():
     has_deploy_any = False
 
     for path in args.results:
-        run = json.loads(Path(path).read_text(encoding="utf-8"))
+        run = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
         has_deploy = any(isinstance(r.get("deploy"), dict) for r in run)
         has_deploy_any = has_deploy_any or has_deploy
         scored = []
@@ -235,6 +269,10 @@ def main():
                   f"[full Checkov pass-rate trên code deploy-được — HEADLINE, n={s['security_n']}]")
         if s["deploy_success"] is not None:
             print(f"  deploy_success   : {s['deploy_success']:.3f}   [env-dependent]")
+        if s.get("time_to_deploy_mean") is not None:
+            print(f"  time_to_deploy   : {s['time_to_deploy_mean']:.1f}s  [mean per row]")
+        if s.get("resource_f1_mean") is not None:
+            print(f"  resource_f1      : {s['resource_f1_mean']:.3f}   [type match vs ground truth]")
         print("  resolved@<=k     : " +
               "  ".join(f"k={k}:{s[f'resolved@<={k}']:.3f}" for k in range(1, _MAX_K + 1)))
         print("  by difficulty:")

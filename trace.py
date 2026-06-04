@@ -10,7 +10,7 @@ Chạy:
     python trace.py
     python trace.py "Create a Lambda function with SQS trigger"
     python trace.py --no-deploy "Create a VPC with public and private subnets"
-    python trace.py --no-secu --no-deploy "Create an RDS PostgreSQL instance"
+    python trace.py --no-deploy "Create an RDS PostgreSQL instance"
 """
 import argparse
 import csv
@@ -49,11 +49,12 @@ from graph import build_initial_state, RECURSION_LIMIT
 from core.retry_control import (
     MAX_VAL_ARCH_RETRY, MAX_DEPLOY_ARCH_RETRY,
     MAX_VAL_ENG_RETRY,  MAX_DEPLOY_ENG_RETRY,
-    MAX_VAL_SEC_RETRY,
+    MAX_VAL_SEC_RETRY,  MAX_DEPLOY_TOTAL_RETRY,
 )
 _MAX_ARCH_RETRY = MAX_VAL_ARCH_RETRY + MAX_DEPLOY_ARCH_RETRY  # 4 tổng 2 phase
 _MAX_ENG_RETRY  = MAX_VAL_ENG_RETRY  + MAX_DEPLOY_ENG_RETRY   # 5 tổng 2 phase
 _MAX_SEC_RETRY  = MAX_VAL_SEC_RETRY                            # 2
+_MAX_DEPLOY_TOTAL_RETRY = MAX_DEPLOY_TOTAL_RETRY               # 4 deploy-phase backstop
 from evaluate import _select_graph
 
 
@@ -244,11 +245,14 @@ def _arrow_next(src: str, dst: str, explanation: str) -> None:
 
 def _rc(state: dict, key: str) -> int:
     """Đọc retry counter từ state.
-    key: 'total' | 'eng' | 'arch' | 'sec' | 'deploy'
+    key: 'total' | 'deploy_total' | 'eng' | 'arch' | 'sec' | 'deploy'
+    'total' = validation-phase backstop; 'deploy_total' = deploy-phase backstop.
     eng/arch aggregate cả val_ và deploy_ phase.
     """
     if key == "total":
-        return state.get("total_attempts", 0)
+        return state.get("total_val_attempts", 0)
+    if key == "deploy_total":
+        return state.get("total_deploy_attempts", 0)
     r = state.get("retries") or {}
     if key == "eng":
         return r.get("val_eng", {}).get("count", 0) + r.get("deploy_eng", {}).get("count", 0)
@@ -568,7 +572,7 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
             _note(f"   budget: total={total_r}/5  eng={eng_r}/{_MAX_ENG_RETRY}  sec={sec_r}/{_MAX_SEC_RETRY}  arch={arch_r}/{_MAX_ARCH_RETRY}")
             print()
             if total_r >= 5:
-                _note("→ total_attempts >= 5: backstop global — dừng để không loop vô hạn")
+                _note("→ total_val_attempts >= 5: backstop global — dừng để không loop vô hạn")
                 _arrow_next(node, "requires_human", f"backstop total_retry={total_r}/5")
             elif et == "MISSING_RESOURCE":
                 if arch_r < _MAX_ARCH_RETRY:
@@ -605,13 +609,21 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
         dr       = update.get("deployment_result") or {}
         ok_      = dr.get("success", False)
         deploy_r = _rc(merged, "deploy")
+        deploy_total = _rc(merged, "deploy_total")
         if ok_:
             _note("→ deployment_result['success']=True")
             _arrow_next(node, "END", "tất cả resource đã được tạo trên AWS thành công")
+        elif deploy_total >= _MAX_DEPLOY_TOTAL_RETRY:
+            et_d = dr.get("error_type", "")
+            _note(f"→ deployment_result['success']=False, error_type={red(et_d)}")
+            _note(f"→ total_deploy_attempts >= {_MAX_DEPLOY_TOTAL_RETRY}: deploy-phase backstop "
+                  f"(ĐỘC LẬP total_val_attempts của A4) — dừng để không loop")
+            _arrow_next(node, "requires_human",
+                        f"backstop total_deploy_attempts={deploy_total}/{_MAX_DEPLOY_TOTAL_RETRY}")
         else:
             et_d = dr.get("error_type", "")
             _note(f"→ deployment_result['success']=False, error_type={red(et_d)}")
-            _note(f"   deploy retry count={deploy_r}")
+            _note(f"   deploy retry count={deploy_r}  total_deploy_attempts={deploy_total}/{_MAX_DEPLOY_TOTAL_RETRY}")
             print()
             if et_d == "TRANSIENT":
                 _note("→ TRANSIENT: network timeout / connection refused / AWS rate limit")
@@ -664,7 +676,7 @@ class _TeeWriter:
 
 # ── Main trace ────────────────────────────────────────────────────────────────
 
-def trace(prompt: str, no_secu: bool = False, no_deploy: bool = False,
+def trace(prompt: str, no_deploy: bool = False,
           auto_destroy: bool = False, plan_timeout: int | None = None,
           row_idx: int | None = None, quiet: bool = False,
           log_path: Path | None = None) -> dict:
@@ -675,7 +687,7 @@ def trace(prompt: str, no_secu: bool = False, no_deploy: bool = False,
     quiet=False + log_path=file : tee ra cả screen lẫn file
     quiet=False + log_path=None : chỉ screen (default)
     """
-    g = _select_graph(no_secu, no_deploy)
+    g = _select_graph(no_deploy)
 
     run_dir = ROOT / "tmp" / "trace"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -703,11 +715,8 @@ def trace(prompt: str, no_secu: bool = False, no_deploy: bool = False,
         print(f"{BOLD}{white('  LangGraph StateGraph: A1 → A2 → A3 → A4 → A5')}{R}")
         print(f"{BOLD}{white('█' * _W)}{R}")
         print(f"\n  {dim('prompt:')} {white(bold(prompt))}")
-        if no_secu or no_deploy:
-            flags = []
-            if no_secu:   flags.append(yellow("--no-secu (bỏ A2)"))
-            if no_deploy: flags.append(yellow("--no-deploy (dừng sau A4)"))
-            print(f"  {dim('flags:')}  {', '.join(flags)}")
+        if no_deploy:
+            print(f"  {dim('flags:')}  {yellow('--no-deploy (dừng sau A4)')}")
 
         # ── Initial state ─────────────────────────────────────────────────────
         print(f"\n  {dim('─' * _W)}")
@@ -771,8 +780,9 @@ def trace(prompt: str, no_secu: bool = False, no_deploy: bool = False,
         _final("overall_passed (A4)", fb.get("overall_passed"),  good=fb.get("overall_passed"))
         if not no_deploy:
             _final("deployment.success", dr.get("success"), good=dr.get("success"))
-        _final("total_attempts", _rc(current_state, "total"))
+        _final("total_val_attempts (val phase)", _rc(current_state, "total"))
         if not no_deploy:
+            _final("total_deploy_attempts (deploy phase)", _rc(current_state, "deploy_total"))
             _final("deploy_retry", _rc(current_state, "deploy"))
 
         rl = current_state.get("routing_log") or []
@@ -810,7 +820,6 @@ if __name__ == "__main__":
                         help="Max rows from CSV (default: no limit)")
     parser.add_argument("--out",     type=str, default=None,
                         help="Save per-run metadata to JSON file")
-    parser.add_argument("--no-secu",    action="store_true", help="Skip A2 Security agent")
     parser.add_argument("--no-deploy",  action="store_true", help="Stop after A4 Validation")
     parser.add_argument("--no-destroy", action="store_true", help="Keep resources after apply")
     parser.add_argument("--plan-timeout", type=int, default=None,
@@ -827,7 +836,6 @@ if __name__ == "__main__":
     check_required_tools()
 
     _common = dict(
-        no_secu=args.no_secu,
         no_deploy=args.no_deploy,
         auto_destroy=not args.no_destroy,
         plan_timeout=args.plan_timeout,
@@ -864,7 +872,7 @@ if __name__ == "__main__":
                 "validate_passed": fb.get("validate_passed"),
                 "plan_passed": fb.get("plan_passed"),
                 "deployment_success": dr.get("success"),
-                "total_attempts": _rc(final, "total"),
+                "total_val_attempts": _rc(final, "total"),
             }
 
         if workers == 1:
@@ -894,7 +902,7 @@ if __name__ == "__main__":
                     with _PRINT_LOCK:
                         print(f"  {mark} [{completed:2d}/{len(rows)}] "
                               f"row={r['row']} diff={r.get('difficulty','?')} "
-                              f"passed={ok} attempts={r.get('total_attempts',0)}")
+                              f"passed={ok} attempts={r.get('total_val_attempts',0)}")
     else:
         # ── Single prompt mode ────────────────────────────────────────────────
         prompt = args.prompt or "Create an S3 bucket with versioning and server-side encryption."
@@ -908,7 +916,7 @@ if __name__ == "__main__":
             "validate_passed": fb.get("validate_passed"),
             "plan_passed": fb.get("plan_passed"),
             "deployment_success": dr.get("success"),
-            "total_attempts": _rc(final, "total"),
+            "total_val_attempts": _rc(final, "total"),
         })
 
     if args.out:

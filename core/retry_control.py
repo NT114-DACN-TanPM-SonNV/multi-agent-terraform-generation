@@ -1,36 +1,55 @@
 """Tập trung quản lý retry budget cho toàn pipeline.
 
-A4 (Validation) và A5 (Deployment) đều có thể route về A3 hoặc A1.
-Hai agent có counter RIÊNG — lỗi A5 là lớp mới (apply-time) không liên quan
-lỗi A4 đã xử lý, nên A5 luôn có đủ budget dù A4 đã dùng hết.
+A4 (Validation) và A5 (Deployment) là HAI PHA có backstop ĐỘC LẬP:
+  - validation phase: fail của A1/A3/A4 đếm vào total_val_attempts (cap MAX_TOTAL_RETRY).
+  - deploy phase:     fail của A5 đếm vào total_deploy_attempts (cap MAX_DEPLOY_TOTAL_RETRY).
+Hai counter tách biệt → A4 đốt hết budget của nó KHÔNG starve A5 (lỗi apply-time là
+lớp mới, không liên quan lỗi A4 đã xử lý). Nếu dùng chung 1 backstop, A4 cạn budget
+sẽ chặn A5 oan dù deploy_eng/deploy_arch còn nguyên.
+
+Vì sao cần backstop (không chỉ dựa per-agent cap)? architecture_node RESET
+val_eng/deploy_eng/sec sau mỗi re-plan → per-agent cap không bound được vòng lặp
+xuyên pha A1↔A3↔A4. total_val_attempts/total_deploy_attempts (không reset) mới là chốt thật.
 
 Keys trong retries dict:
-  val_eng     — A4 → A3 (SYNTAX/LOGIC/SECURITY)
-  val_arch    — A4 → A1 (MISSING_RESOURCE)
-  deploy_eng  — A5 → A3 (LOGIC_DEPLOY)
-  deploy_arch — A5 → A1 (MISSING_RESOURCE_DEPLOY)
-  sec         — security gate trong A4 (best-effort khi hết)
+  val_eng     — A4 → A3 (SYNTAX/LOGIC/SECURITY)    → bump total_val_attempts
+  val_arch    — A4 → A1 (MISSING_RESOURCE)         → bump total_val_attempts
+  deploy_eng  — A5 → A3 (LOGIC_DEPLOY)             → bump total_deploy_attempts
+  deploy_arch — A5 → A1 (MISSING_RESOURCE_DEPLOY)  → bump total_deploy_attempts
+  sec         — security gate trong A4 (best-effort khi hết) → bump total_val_attempts
 """
 from dataclasses import dataclass, field
 
 from core.state import AgentState, RetryTracker
 
 # ── Retry budgets — single source of truth ────────────────────────────────────
-MAX_TOTAL_RETRY       = 5  # global backstop — pipeline dừng hẳn sau 5 lần fail tổng
-MAX_VAL_ENG_RETRY     = 3  # A4 → A3: nhiều hơn A5 vì validate rẻ hơn apply
-MAX_VAL_ARCH_RETRY    = 2  # A4 → A1: re-plan ít thôi, thường fix trong 1-2 lần
-MAX_VAL_SEC_RETRY     = 2  # security gate — hết → best-effort (không block deploy)
-MAX_DEPLOY_ENG_RETRY  = 2  # A5 → A3: ít hơn A4 vì mỗi lần apply tốn tiền AWS
-MAX_DEPLOY_ARCH_RETRY = 2  # A5 → A1: độc lập val_arch
+MAX_TOTAL_RETRY        = 5  # validation-phase backstop — dừng sau 5 fail của A1/A3/A4
+MAX_VAL_ENG_RETRY      = 3  # A4 → A3: nhiều hơn A5 vì validate rẻ hơn apply
+MAX_VAL_ARCH_RETRY     = 2  # A4 → A1: re-plan ít thôi, thường fix trong 1-2 lần
+MAX_VAL_SEC_RETRY      = 2  # security gate — hết → best-effort (không block deploy)
+MAX_DEPLOY_ENG_RETRY   = 2  # A5 → A3: ít hơn A4 vì mỗi lần apply tốn tiền AWS
+MAX_DEPLOY_ARCH_RETRY  = 2  # A5 → A1: độc lập val_arch
+MAX_DEPLOY_TOTAL_RETRY = 4  # deploy-phase backstop — dừng sau 4 fail của A5, ĐỘC LẬP total_val_attempts
+                            # (= deploy_eng2 + deploy_arch2: per-agent cap là ràng buộc chính)
 
-# Template tracker rỗng — dùng khi agent chưa có entry trong retries dict.
-# Không dùng RetryTracker() vì TypedDict() trả {} không có keys → KeyError khi đọc.
-_BLANK_TRACKER: dict = {
-    "count": 0,
-    "last_error_type": "",
-    "last_error_details": "",
-    "error_history": [],
-}
+def new_tracker() -> RetryTracker:
+    """Tạo tracker rỗng MỚI (mutable) — single source of truth cho schema RetryTracker.
+
+    Dùng khi khởi tạo state (graph.build_initial_state) và khi reset counter
+    (architecture_node sau re-plan). Mỗi lần gọi trả dict mới → không chia sẻ
+    reference (tránh mutate nhầm tracker khác).
+    Không dùng RetryTracker() vì TypedDict() trả {} không có keys → KeyError khi đọc.
+    """
+    return {
+        "count": 0,
+        "last_error_type": "",
+        "last_error_details": "",
+        "error_history": [],
+    }
+
+
+# Fallback read-only khi agent chưa có entry trong retries dict (chỉ đọc, không mutate).
+_BLANK_TRACKER: RetryTracker = new_tracker()
 
 
 def increment_retry(
@@ -50,7 +69,7 @@ def increment_retry(
     history = list(old["error_history"])  # copy để tránh mutate list cũ
     history.append(error_type)
     if len(history) > 5:
-        history.pop(0)  # giữ 5 lỗi gần nhất cho oscillation detection
+        history.pop(0)  # giữ 5 lỗi gần nhất cho LLM context (tránh lặp lỗi cũ) + debug
     state["retries"] = {
         **state["retries"],
         agent: {
@@ -60,7 +79,12 @@ def increment_retry(
             "error_history": history,
         },
     }
-    state["total_attempts"] = state["total_attempts"] + 1
+    # Phase-scoped backstop: fail của A5 (deploy_eng/deploy_arch) đếm vào total_deploy_attempts
+    # riêng để A4 không starve A5; mọi fail khác (A1/A3/A4) đếm vào total_val_attempts.
+    if agent in ("deploy_eng", "deploy_arch"):
+        state["total_deploy_attempts"] = state["total_deploy_attempts"] + 1
+    else:
+        state["total_val_attempts"] = state["total_val_attempts"] + 1
 
 
 def check_retry_budget(
@@ -84,57 +108,6 @@ def check_retry_budget(
         return False, f"{agent} đã retry {count}/{max_retries} lần"
 
     return True, ""
-
-
-def detect_oscillation(
-    state: AgentState,
-    agent: str,
-    current_error_type: str,
-) -> bool:
-    """Phát hiện oscillation — agent đang sửa nhưng lỗi vẫn lặp lại theo pattern.
-
-    Gọi SAU increment_retry, nên current_error_type đã nằm ở cuối history[-1].
-
-    3 patterns được kiểm:
-
-    Pattern 1 — cùng lỗi 3 lần: [A, A, A]
-      history[-3:] == [current, current, current]
-
-    Pattern 2 — xoay vòng 2 loại: [A, B, A, B]
-      current = B → B ở vị trí [-1] và [-3]; A ở [-2] và [-4]
-      Điều kiện: history[-3] == history[-1] == B và history[-4] == history[-2] != B
-
-    Pattern 3 — xoay vòng 3 loại: [A, B, C, A, B]
-      current = B → B xuất hiện lần trước ở [-4]; 5 phần tử gần nhất có đúng 3 loại
-      Điều kiện: history[-4] == current và len(set(history[-5:])) == 3
-
-    Trả False nếu history chưa đủ dài để đánh giá.
-    """
-    tracker = state["retries"].get(agent)
-    if not tracker:
-        return False
-    history = tracker["error_history"]
-
-    if len(history) < 3:
-        return False
-
-    # Pattern 1: A→A→A
-    if history[-3:] == [current_error_type] * 3:
-        return True
-
-    # Pattern 2: A→B→A→B (B = current, ở vị trí [-1] và [-3])
-    if len(history) >= 4:
-        if (history[-3] == history[-1] == current_error_type and
-                history[-4] == history[-2] and history[-4] != current_error_type):
-            return True
-
-    # Pattern 3: A→B→C→A→B (B = current, xuất hiện cách 3 bước ở [-4])
-    if len(history) >= 5:
-        if (history[-4] == current_error_type and
-                len(set(history[-5:])) == 3):
-            return True
-
-    return False
 
 
 def get_retry_summary(state: AgentState) -> dict:

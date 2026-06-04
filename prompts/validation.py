@@ -23,8 +23,12 @@ MISSING_RESOURCE  Plan failed because a resource type is entirely absent from th
 
 ── fix_instruction rules ─────────────────────────────────────────────────────
 1. Always name the exact resource label (e.g. aws_db_instance.main).
-2. State the exact attribute or block to add/change and its value.
-3. MISSING_RESOURCE: name the resource type to add and which existing resource references it.
+2. State the exact attribute or block to add/change and its value. When the fix
+   requires adding a new resource or block, include ALL required arguments with
+   concrete values — do not leave any required argument to be inferred. Incomplete
+   additions will fail in the next validation round and waste retry budget.
+3. MISSING_RESOURCE: name the resource type to add, which resource references it,
+   and ALL required arguments with concrete values.
 4. Only reference resource labels present in GENERATED HCL RESOURCES, except for MISSING_RESOURCE.
 5. Return ONLY raw JSON. No markdown, no explanation.\
 """
@@ -44,7 +48,8 @@ SYNTAX_CONTEXT = (
     "{validate_err}\n\n"
     "{code_context}"
     "GENERATED HCL RESOURCES: {labels}\n"
-    "ERROR HISTORY: {history}"
+    "ERROR HISTORY (types only): {history}\n"
+    "{prev_fixes}"
 )
 # Khối code-context lồng vào SYNTAX_CONTEXT khi trích được (rỗng nếu không).
 FAILING_CODE_CONTEXT = (
@@ -59,7 +64,9 @@ INIT_FIX = "terraform init failed — fix the HCL:\n{err}"
 PLAN_CONTEXT = (
     "TERRAFORM VALIDATE: passed\nTERRAFORM PLAN: FAILED\n{plan_err}\n\n"
     "GENERATED HCL RESOURCES: {labels}\n"
-    "ERROR HISTORY: {history}"
+    "{failing_resource_body}"
+    "ERROR HISTORY (types only): {history}\n"
+    "{prev_fixes}"
 )
 
 # Checkov pass nhưng còn security best-practice chưa đạt → fix_instruction gửi thẳng A3.
@@ -70,12 +77,6 @@ PLAN_CONTEXT = (
 # ưu tiên in-place, thêm CONFIGURATION companion khi không biểu diễn in-place được, không
 # thêm service/functional resource ngoài item, không đụng phần không liên quan.
 SECURITY_FIX = (
-    "The configuration is valid and plannable, but these security best practices "
-    "are not yet met. Satisfy EACH item, following your hardening rules: set the "
-    "attribute in-place on the resource that is ALREADY in the configuration when the "
-    "property supports it; if it does not (e.g. S3 encryption, versioning or "
-    "public-access settings, which AWS provider ~> 5.0 expresses as dedicated "
-    "configuration resources), add the matching configuration companion that "
-    "references the existing resource. Do NOT add any service/functional resource "
-    "beyond what an item requires, and do NOT change anything unrelated:\n{items}"
+    "These security checks are not yet satisfied. Fix EACH item following your "
+    "hardening rules. Do not change anything unrelated:\n{items}"
 )

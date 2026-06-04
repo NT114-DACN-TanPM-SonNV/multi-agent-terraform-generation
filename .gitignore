@@ -25,6 +25,9 @@ logs/
 
 # Runtime output files (evaluate --out, trace --out, benchmark timing)
 time-*.json
+reviews/*.json
+*case*.txt
+trace*.txt
 
 # Virtual environments
 .venv/

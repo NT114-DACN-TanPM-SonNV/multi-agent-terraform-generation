@@ -7,7 +7,6 @@ Chạy:
     python evaluate.py --csv dataset/data-test.csv
     python evaluate.py --csv dataset/data-dev.csv --limit 5
     python evaluate.py --csv dataset/data-test.csv --cases 0 3 7-10
-    python evaluate.py --no-secu --csv dataset/data-test.csv
     python evaluate.py --no-deploy --csv dataset/data-test.csv
     python evaluate.py --no-destroy --csv dataset/data-test.csv
     python evaluate.py --workers 3 --csv dataset/data-test.csv
@@ -74,48 +73,6 @@ _PRINT_LOCK = threading.Lock()
 
 # ─── Variant graphs ───────────────────────────────────────────────────────────
 
-def _shared_deploy_edges(g: StateGraph) -> None:
-    """Thêm deployment node + conditional edges chung cho mọi variant có deploy."""
-    g.add_node("deployment", deployment_node)
-    g.add_conditional_edges("deployment", route_after_deployment, {
-        "end":            END,
-        "deployment":     "deployment",
-        "engineering":    "engineering",
-        "architecture":   "architecture",
-        "requires_human": "requires_human",
-    })
-
-
-def build_no_secu_graph():
-    """Graph bỏ security node: architecture → engineering trực tiếp.
-    route_after_validation có thể trả "security" → map về "engineering".
-    """
-    g = StateGraph(AgentState)
-    g.add_node("architecture",    architecture_node)
-    g.add_node("engineering",     engineering_node)
-    g.add_node("validation",      validation_node)
-    g.add_node("requires_human",  requires_human_node)
-    _shared_deploy_edges(g)
-
-    g.add_edge(START, "architecture")
-    g.add_conditional_edges("architecture", route_after_architecture, {
-        "security":       "engineering",   # secu absent → fall back to engi
-        "requires_human": "requires_human",
-    })
-    g.add_conditional_edges("engineering", route_after_engineering, {
-        "validation":     "validation",
-        "requires_human": "requires_human",
-    })
-    g.add_conditional_edges("validation", route_after_validation, {
-        "deployment":     "deployment",
-        "architecture":   "architecture",
-        "engineering":    "engineering",
-        "requires_human": "requires_human",
-    })
-    g.add_edge("requires_human", END)
-    return g.compile()
-
-
 def build_no_deploy_graph():
     """Graph dừng sau validation (không có deployment node)."""
     g = StateGraph(AgentState)
@@ -145,38 +102,7 @@ def build_no_deploy_graph():
     return g.compile()
 
 
-def build_no_secu_no_deploy_graph():
-    """Kết hợp: bỏ security + dừng sau validation."""
-    g = StateGraph(AgentState)
-    g.add_node("architecture",   architecture_node)
-    g.add_node("engineering",    engineering_node)
-    g.add_node("validation",     validation_node)
-    g.add_node("requires_human", requires_human_node)
-
-    g.add_edge(START, "architecture")
-    g.add_conditional_edges("architecture", route_after_architecture, {
-        "security":       "engineering",   # secu absent → fall back to engi
-        "requires_human": "requires_human",
-    })
-    g.add_conditional_edges("engineering", route_after_engineering, {
-        "validation":     "validation",
-        "requires_human": "requires_human",
-    })
-    g.add_conditional_edges("validation", route_after_validation, {
-        "deployment":     END,
-        "architecture":   "architecture",
-        "engineering":    "engineering",
-        "requires_human": "requires_human",
-    })
-    g.add_edge("requires_human", END)
-    return g.compile()
-
-
-def _select_graph(no_secu: bool, no_deploy: bool):
-    if no_secu and no_deploy:
-        return build_no_secu_no_deploy_graph()
-    if no_secu:
-        return build_no_secu_graph()
+def _select_graph(no_deploy: bool):
     if no_deploy:
         return build_no_deploy_graph()
     return _default_graph
@@ -260,7 +186,8 @@ def _timeout_sentinel(row_args: tuple, *, timeout: bool = False, error: str | No
         "row": idx, "difficulty": difficulty, "prompt": prompt,
         "timeout": timeout,
         "archi": {"ok": False}, "secu": {}, "engi": {}, "val": {}, "deploy": None,
-        "total_retry_count": 0, "deploy_retry_count": 0,
+        "total_retry_count": 0, "val_retry_count": 0,
+        "deploy_backstop_count": 0, "deploy_retry_count": 0,
         "routing_log": [], "iterations": 0, "resource_match": {},
     }
     if error:
@@ -274,7 +201,6 @@ def _extract_results(
     final_state: dict,
     timings: dict[str, float],
     node_counts: dict[str, int],
-    no_secu: bool,
     no_deploy: bool,
     val_feedback: dict | None = None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None, dict | None]:
@@ -297,11 +223,7 @@ def _extract_results(
 
     # secu
     secu_result = None
-    if no_secu:
-        secu_result = {
-            "ok": True, "elapsed_s": 0, "skipped": True,
-        }
-    elif "security" in timings:
+    if "security" in timings:
         secu_result = {
             "ok": True,
             "elapsed_s": timings["security"],
@@ -339,6 +261,7 @@ def _extract_results(
             "validate_ok": fb.get("validate_passed"),
             "plan_ok": fb.get("plan_passed"),
             "security_incomplete": bool(fb.get("unmet_checks")),
+            "security_degraded": bool(fb.get("security_degraded")),
             "unmet_checks": fb.get("unmet_checks", []),
             "phantom_checks": fb.get("phantom_checks", []),
             "raw_error": (fb.get("raw_error") or "")[:2000],
@@ -374,7 +297,6 @@ def run_row_lg(
     prompt: str,
     g,
     auto_destroy: bool,
-    no_secu: bool,
     no_deploy: bool,
     gt_types: list[str] | None = None,
     live: bool = False,
@@ -436,8 +358,6 @@ def run_row_lg(
                         fb = update.get("fix_feedback") or {}
                         log(f"  [archi] FAILED ({elapsed}s): "
                             f"{(fb.get('fix_instruction') or '')[:200]}")
-                    if no_secu:
-                        log(f"  [secu]  skipped (--no-secu)")
 
                 elif node_name == "security":
                     prof = update.get("security_profile") or {}
@@ -474,7 +394,7 @@ def run_row_lg(
                               f"fail_ids={ck.get('failed_ckv_ids',[])}"
                               + (f" phantom={phantom}" if phantom else "")) if ck else ""
                     attempt = node_counts.get("validation", 0)
-                    total_r = final_state.get("total_attempts", 0)
+                    total_r = final_state.get("total_val_attempts", 0)
                     log(f"  [val]   {status} ({elapsed}s) {ck_str}"
                         f" attempt={attempt} total_retry={total_r}")
                     if not passed and fb.get("fix_instruction"):
@@ -525,7 +445,7 @@ def run_row_lg(
 
     # Extract structured results
     archi_result, secu_result, engi_result, val_result, deploy_result = _extract_results(
-        final_state, timings, node_counts, no_secu, no_deploy,
+        final_state, timings, node_counts, no_deploy,
         val_feedback=last_val_fb or None,
     )
 
@@ -553,14 +473,20 @@ def run_row_lg(
         "engi":   engi_result,
         "val":    val_result,
         "deploy": deploy_result,
-        "total_retry_count":  final_state.get("total_attempts", 0),
+        # total_retry_count = mọi fail toàn run (val phase + deploy phase) — giữ ngữ nghĩa
+        # cũ cho score.py sau khi tách backstop thành total_val_attempts + total_deploy_attempts.
+        "total_retry_count":  (final_state.get("total_val_attempts", 0)
+                               + final_state.get("total_deploy_attempts", 0)),
+        "val_retry_count":    final_state.get("total_val_attempts", 0),
+        "deploy_backstop_count": final_state.get("total_deploy_attempts", 0),
         "deploy_retry_count": (
             (final_state.get("retries") or {}).get("deploy_eng",  {}).get("count", 0) +
             (final_state.get("retries") or {}).get("deploy_arch", {}).get("count", 0)
         ),
-        "routing_log": final_state.get("routing_log", []),
-        "iterations":  iterations,
-        "resource_match": cmp,
+        "routing_log":     final_state.get("routing_log", []),
+        "iterations":      iterations,
+        "resource_match":  cmp,
+        "total_elapsed_s": round(sum(timings.values()), 1),
     }
     return result, "\n".join(lines)
 
@@ -598,7 +524,6 @@ def main():
     parser.add_argument("--out",      type=str, default=None, help="Output JSON path")
     parser.add_argument("--cases",    nargs="+", default=None,
                         help="Row indices, e.g. --cases 0 3 7-10 15")
-    parser.add_argument("--no-secu",    action="store_true", help="Bỏ qua A2")
     parser.add_argument("--no-deploy",  action="store_true", help="Dừng sau A4")
     parser.add_argument("--no-destroy", action="store_true", help="Giữ resources sau apply")
     parser.add_argument("--workers",  type=int, default=1,
@@ -631,7 +556,7 @@ def main():
     print(f"Full pipeline A1→A2→A3→A4→A5 [LangGraph]  |  model={model}  "
           f"|  csv={CSV_PATH.name}  |  deploy={deploy_str}  |  workers={args.workers}")
 
-    g = _select_graph(args.no_secu, args.no_deploy)
+    g = _select_graph(args.no_deploy)
 
     rows = load_csv(args.limit)
     if args.cases:
@@ -650,7 +575,6 @@ def main():
         return run_row_lg(
             idx, difficulty, prompt, g,
             auto_destroy=not args.no_destroy,
-            no_secu=args.no_secu,
             no_deploy=args.no_deploy,
             gt_types=gt_types,
             live=live,
@@ -754,7 +678,7 @@ def main():
     out_path = (Path(args.out) if args.out
                 else ROOT / "reviews" / "pipeline_lg_results.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nSaved {len(results)} results → {out_path}")
 
 

@@ -2,7 +2,7 @@
 
     python run.py "Create an S3 bucket with versioning"
     python run.py "Create an RDS instance" --no-deploy
-    python run.py "Create a Lambda function" --no-secu --no-deploy
+    python run.py "Create a Lambda function" --no-deploy
 """
 import argparse
 import json
@@ -22,9 +22,9 @@ from graph import build_initial_state, RECURSION_LIMIT
 from evaluate import _select_graph
 
 
-def run(prompt: str, no_secu: bool = False, no_deploy: bool = False,
+def run(prompt: str, no_deploy: bool = False,
         auto_destroy: bool = False) -> dict:
-    g = _select_graph(no_secu, no_deploy)
+    g = _select_graph(no_deploy)
     state = build_initial_state(prompt, auto_destroy=auto_destroy)
 
     print(f"\nprompt: {prompt}\n")
@@ -92,12 +92,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline — compact output")
     parser.add_argument("prompt", nargs="?",
                         default="Create an S3 bucket with versioning and SSE enabled.")
-    parser.add_argument("--no-secu",    action="store_true")
     parser.add_argument("--no-deploy",  action="store_true")
     parser.add_argument("--no-destroy", action="store_true")
     args = parser.parse_args()
 
-    final = run(args.prompt, no_secu=args.no_secu, no_deploy=args.no_deploy,
+    final = run(args.prompt, no_deploy=args.no_deploy,
                 auto_destroy=not args.no_destroy)
 
     fb = final.get("fix_feedback") or {}

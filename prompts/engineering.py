@@ -12,6 +12,8 @@ Output (raw HCL only — no markdown, no explanation, no ```hcl fences):
 ── Serialization ────────────────────────────────────────────────────────────────
 Each plan object has: type, name, attributes, blocks.
 
+S0. Use AWS provider version = "~> 5.0" in the required_providers block.
+
 attributes → rendered as `arg = value`:
   scalar (bool / number / string), list of primitives ["a", "b"],
   map { Key = "val" }, REF: reference → strip prefix → bare reference.
@@ -34,19 +36,7 @@ S5. Do not add resources that provide application functionality beyond the plan.
 The security context lists per-resource checks to satisfy, each with its check name.
 For each check, implement it using the most direct approach:
 
-H1. Prefer in-place hardening — set the attribute that controls the property directly
-    on the resource block (e.g. encrypted = true, kms_key_id = "...").
-
-H2. When a property cannot be set in-place, add a security companion resource:
-      configuration companion — zero-cost, only toggles a setting (e.g.
-        aws_s3_bucket_public_access_block, aws_s3_bucket_server_side_encryption_configuration).
-        Always permitted when needed.
-      service companion — provisions a separate cost-bearing service (e.g. aws_kms_key,
-        aws_cloudwatch_log_group). Add only when the check name explicitly requires it
-        and the user request signals production or sensitive data.
-
-H3. Apply only attributes and companion types that exist in AWS provider ~> 5.0.
-    When unsure whether an attribute or resource type exists, omit it rather than guess.\
+{HARDENING_RULES}\
 """
 
 USER_TEMPLATE = """\
@@ -56,3 +46,19 @@ Plan:
 Security checks to implement per resource:
 {SECURITY_CONTEXT}\
 """
+
+# Template header khi A3 nhận fix_instruction từ A4/A5 (incremental patch).
+PATCH_HEADER = (
+    "Your previous HCL had an error. "
+    "Make ONLY the fix below — do not change anything else:\n\n"
+    "FIX:\n"
+)
+PREV_CODE_HEADER   = "\n\nPREVIOUS CODE (keep everything except the fix):\n"
+PREV_ERRORS_HEADER = "\n\nPREVIOUS ERRORS (do NOT reintroduce these):\n"
+
+# Retry khi LLM output không chứa resource block nào.
+NO_RESOURCE_RETRY = (
+    "Your response did not contain any `resource \"` blocks. "
+    "Output the complete Terraform HCL with ALL resource blocks "
+    "from the plan. Do not omit any resource."
+)

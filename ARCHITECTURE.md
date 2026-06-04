@@ -48,11 +48,15 @@ retries                 → {
                             "deploy_arch":{count, ...}  A5 → A1 (MISSING_RESOURCE_DEPLOY) — độc lập
                             "sec":        {count, ...}  security gate trong A4
                           }
-total_attempts          → global backstop counter (max 5)
-routing_log             → audit trail mỗi lần fail/retry
-arch_error_history      → 2 fix gần nhất để chống A1 re-plan lặp lại
-eng_error_history       → 2 fix gần nhất để chống A3 sửa lặp lại
+total_val_attempts      → validation-phase backstop (max 5) — tăng khi A1/A3/A4 fail
+total_deploy_attempts   → deploy-phase backstop (max 4) — tăng khi A5 fail, ĐỘC LẬP val phase
+                          (tách để A4 đốt hết budget của nó không starve A5)
+security_status         → "ok" | "degraded" — "degraded" khi A2 LLM fail → 0 check không do intent
+routing_log             → audit trail mỗi lần fail/retry (kể cả A2 degraded bypass)
+arch_error_history      → list fix capped 5, bơm [-2:] vào prompt chống A1 re-plan lặp lại
+eng_error_history       → list fix capped 5, bơm [-2:] vào prompt chống A3 sửa lặp lại
 run_dir                 → working dir cho eval batch (mặc định "" = dùng tempdir)
+                          A4 và A5 dùng chung thư mục này — A5 skip terraform init nếu .terraform/ đã có
 ```
 
 ---
@@ -145,7 +149,8 @@ Static syntax check. Lỗi → classify SYNTAX → gửi fix về A3.
 
 **Bước 3 — terraform plan -out=tfplan.out**
 Logical check (AWS API). Lỗi:
-- Network/auth pattern → INFRASTRUCTURE → requires_human
+- Auth/credential pattern (`AUTH_PATTERNS` từ `core/errors.py`, sync với A5) → INFRASTRUCTURE → requires_human
+- Network/throttle pattern → INFRASTRUCTURE (in-node retry 1 lần) → requires_human
 - "not found" pattern → MISSING_RESOURCE → A1 re-plan
 - Khác → LLM classify LOGIC → A3 fix
 
@@ -169,7 +174,6 @@ checkov -f plan.json --framework terraform_plan --output json
 overall_passed=True                → deployment
 total_attempts >= 5                → requires_human  (global backstop)
 error_type == INFRASTRUCTURE       → requires_human
-oscillation detected               → requires_human
 root_cause == architecture         → A1  (nếu còn val_arch budget, max 2)
 root_cause == engineering          → A3  (nếu còn val_eng budget, max 3)
 SECURITY hết sec budget            → best-effort deploy (không block)
@@ -182,13 +186,15 @@ SECURITY hết sec budget            → best-effort deploy (không block)
 **Input:** `state["generated_code"]`
 
 **Việc làm:**
+- `terraform init` (skip nếu `.terraform/` đã có từ A4 — cùng `run_dir`)
 - `terraform apply` thật trên AWS
 - Nếu `auto_destroy=True` (eval mode): `terraform destroy` ngay sau apply thành công
 - Fail → classify lỗi:
-  - TRANSIENT (network/throttle) → retry A5 (max 2 lần)
-  - FIXABLE/LOGIC (code sai) → A3 fix
-  - MISSING_RESOURCE → A1 re-plan
-  - UNKNOWN / hết budget → requires_human
+  - INFRASTRUCTURE (network/throttle) → in-node retry 1 lần với backoff, sau đó requires_human
+  - OTHER / credential error → requires_human trực tiếp (không retry)
+  - LOGIC (code sai) → A3 fix (deploy_eng ≤ 2)
+  - MISSING_RESOURCE → A1 re-plan (deploy_arch ≤ 2)
+  - destroy_failed → requires_human (dirty state, không retry)
 
 **Output:** `state["deployment_result"]`
 
@@ -205,16 +211,18 @@ retries["sec"]        max 2  — security gate A4 → A3, hết → best-effort 
 retries["deploy_eng"] max 2  — A5 → A3 (LOGIC_DEPLOY), độc lập val_eng
 retries["deploy_arch"]max 2  — A5 → A1 (MISSING_RESOURCE_DEPLOY), độc lập val_arch
 
-total_attempts        max 5  — global backstop tuyệt đối
+total_val_attempts    max 5  — validation-phase backstop (A1/A3/A4 fail)
+total_deploy_attempts max 4  — deploy-phase backstop (A5 fail) — ĐỘC LẬP với val phase
 
-Lý do tách A4/A5: lỗi A5 là lớp mới (apply-time) không liên quan lỗi cũ A4 đã fix.
-A5 luôn có budget riêng dù A4 đã dùng hết.
+Tại sao tách backstop?
+  Nếu dùng 1 counter chung: A4 đốt hết 5 → A5 bị starve ngay lần đầu apply.
+  Lỗi apply-time là lớp mới (A4 đã pass), A5 phải có ngân sách retry riêng.
+  architecture_node RESET val_eng/deploy_eng/sec mỗi re-plan → chỉ total_*
+  (không reset) mới bound được loop xuyên pha.
 
-Oscillation detection (core/retry_control.py):
-  Pattern 1: cùng lỗi 3 lần liên tiếp      (A→A→A)
-  Pattern 2: xoay vòng 2 loại               (A→B→A→B)
-  Pattern 3: xoay vòng 3 loại               (A→B→C→A→B)
-→ requires_human ngay khi phát hiện
+Chống loop: per-counter budget (mỗi loại ≤ 2-3) + hai phase backstop là cơ chế
+chặn loop duy nhất. Mọi đường fail đều +1 counter tương ứng → pipeline luôn hội
+tụ về deployment hoặc requires_human trong số vòng hữu hạn.
 ```
 
 ---
@@ -245,7 +253,7 @@ agents/           → logic từng agent
 prompts/          → system/user prompt từng agent
 core/terraform.py → wrappers: run_terraform, terraform_workdir,
                     run_checkov_on_hcl, run_checkov_on_plan
-core/retry_control.py → increment_retry, check_retry_budget, detect_oscillation
+core/retry_control.py → increment_retry, check_retry_budget
 ```
 
 ---

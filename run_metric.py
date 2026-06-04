@@ -1,12 +1,17 @@
-"""Multi-run metric harness — chạy evaluate.py k lần rồi gộp bằng score.py.
+"""Multi-run metric harness — chạy pipeline hoặc baseline k lần rồi gộp bằng score.py.
 
-Vì model reasoning (v4-pro) non-deterministic cross-run, 1 run KHÔNG đủ; harness này
-chạy lặp rồi score.py tính pass@k + mean±std (xem reference_macog_multiagent: mean over
-tasks + bootstrap CI, project_metrics). Model lấy từ .env (DEEPSEEK_MODEL) — KHÔNG đổi ở đây.
+Vì model non-deterministic cross-run, 1 run KHÔNG đủ; harness này chạy lặp rồi score.py
+tính pass@k + mean±std. Model lấy từ .env (DEEPSEEK_MODEL) — KHÔNG đổi ở đây.
 
-Ví dụ:
-  python run_metric.py --csv dataset/data-dev.csv --cases 0 7 33 --runs 3
+Pipeline (mặc định):
+  python run_metric.py --csv dataset/data-dev.csv --runs 3
   python run_metric.py --csv dataset/data-dev.csv --runs 3 --no-deploy
+
+Baseline B0 (no retry):
+  python run_metric.py --csv dataset/data-dev.csv --runs 3 --baseline --prefix b0
+
+Baseline B1 (with retry):
+  python run_metric.py --csv dataset/data-dev.csv --runs 3 --baseline --retry 3 --prefix b1
 """
 import argparse
 import subprocess
@@ -19,15 +24,18 @@ REVIEWS = Path("reviews")
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv", required=True, help="Dataset CSV")
-    ap.add_argument("--cases", nargs="+", default=None, help="Row indices (mặc định: tất cả)")
-    ap.add_argument("--runs", type=int, default=3, help="Số lần chạy mỗi case (mặc định 3)")
-    ap.add_argument("--workers", type=int, default=3, help="Song song trong 1 run")
-    ap.add_argument("--no-deploy", action="store_true", help="Bỏ A5 deploy")
-    ap.add_argument("--prefix", default="metric", help="Tiền tố file output trong reviews/")
-    ap.add_argument("--no-rego", action="store_true", help="Bỏ chấm semantic_correct (opa)")
+    ap.add_argument("--csv",        required=True, help="Dataset CSV")
+    ap.add_argument("--cases",      nargs="+", default=None, help="Row indices (mặc định: tất cả)")
+    ap.add_argument("--runs",       type=int, default=3, help="Số lần chạy (mặc định 3)")
+    ap.add_argument("--workers",    type=int, default=3, help="Song song trong 1 run (pipeline only)")
+    ap.add_argument("--no-deploy",  action="store_true", help="Bỏ A5 deploy (pipeline only)")
+    ap.add_argument("--prefix",     default="metric", help="Tiền tố file output trong reviews/")
+    ap.add_argument("--no-rego",    action="store_true", help="Bỏ chấm semantic_correct (opa)")
     ap.add_argument("--no-checkov", action="store_true", help="Bỏ chấm security_score (checkov)")
-    ap.add_argument("--resume", action="store_true", help="Bỏ qua run đã có file")
+    ap.add_argument("--resume",     action="store_true", help="Bỏ qua run đã có file")
+    ap.add_argument("--baseline",   action="store_true", help="Chạy baseline.py thay vì evaluate.py")
+    ap.add_argument("--retry",      type=int, default=0,
+                    help="Retry cho baseline: 0=B0, 3=B1 (chỉ dùng với --baseline)")
     args = ap.parse_args()
 
     REVIEWS.mkdir(exist_ok=True)
@@ -38,12 +46,20 @@ def main():
         if args.resume and out.exists():
             print(f"[run {i}/{args.runs}] skip — đã có {out}")
             continue
-        cmd = ["uv", "run", "python3", "evaluate.py", "--csv", args.csv,
-               "--out", str(out), "--workers", str(args.workers)]
+
+        if args.baseline:
+            cmd = ["uv", "run", "python3", "baseline.py",
+                   "--csv", args.csv, "--out", str(out),
+                   "--retry", str(args.retry)]
+        else:
+            cmd = ["uv", "run", "python3", "evaluate.py",
+                   "--csv", args.csv, "--out", str(out),
+                   "--workers", str(args.workers)]
+            if args.no_deploy:
+                cmd.append("--no-deploy")
+
         if args.cases:
             cmd += ["--cases", *args.cases]
-        if args.no_deploy:
-            cmd.append("--no-deploy")
         print(f"\n{'='*70}\n[run {i}/{args.runs}] {' '.join(cmd)}\n{'='*70}")
         r = subprocess.run(cmd)
         if r.returncode != 0:

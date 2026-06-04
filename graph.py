@@ -6,7 +6,7 @@ Topology:
     validation ─(route_after_validation)─→ deployment        (pass)
                                          → architecture       (MISSING_RESOURCE)
                                          → engineering        (SYNTAX/LOGIC/SECURITY)
-                                         → requires_human     (INFRASTRUCTURE/budget/oscillation)
+                                         → requires_human     (INFRASTRUCTURE/budget)
 
     deployment ─(route_after_deployment)─→ END                (success)
                                          → engineering        (LOGIC — code fix)
@@ -29,6 +29,7 @@ import os
 from langgraph.graph import StateGraph, START, END
 
 from core.state import AgentState
+from core.retry_control import new_tracker
 from agents.architecture import architecture_node
 from agents.security import security_node
 from agents.engineering import engineering_node
@@ -38,10 +39,11 @@ from agents.deployment import deployment_node, route_after_deployment
 logger = logging.getLogger(__name__)
 
 # Cao hơn default 25 vì các vòng retry (mỗi cycle 2-5 node) có thể vượt 25 trước khi
-# chạm cap total_attempts=5. Worst-case (A4 5 retry + A5 transient/eng/arch) ~44 node
-# → 100 cho margin; các cap retry thật mới là chốt chặn loop,
-# RECURSION_LIMIT chỉ là trần an toàn (không gây loop vô hạn vì cap đã bound).
-RECURSION_LIMIT = 100
+# chạm cap. Hai backstop độc lập theo pha (validation total_val_attempts=5 + deploy
+# total_deploy_attempts=4) cho phép node count cao hơn cap chung total=5 cũ → nâng margin.
+# Worst-case (A4 5 retry + A5 4 retry, xen kẽ re-plan) ~70 node → 150 cho margin;
+# các cap retry thật mới là chốt chặn loop, RECURSION_LIMIT chỉ là trần an toàn.
+RECURSION_LIMIT = 150
 
 
 def route_after_architecture(state: AgentState) -> str:
@@ -50,7 +52,7 @@ def route_after_architecture(state: AgentState) -> str:
     Tại sao cần?
     A1 fail → make_fail("INFRASTRUCTURE") chỉ set fix_feedback, KHÔNG set infrastructure_plan.
     Nếu cứ xuôi A2→A3→A4, A4 thấy code rỗng → MISSING_RESOURCE → route về A1 → loop
-    đốt cạn total_attempts mà không sửa được gì.
+    đốt cạn total_val_attempts mà không sửa được gì.
 
     Tại sao check error_type thay vì infrastructure_plan rỗng?
     A1 success luôn clear fix_feedback={}, nên error_type chỉ tồn tại khi A1 vừa fail.
@@ -127,9 +129,6 @@ def build_initial_state(prompt: str,
                         terraform_plan_timeout: int | None = None,
                         auto_destroy: bool = False) -> AgentState:
     """Khởi tạo đầy đủ AgentState — TypedDict không có default, thiếu field → KeyError."""
-    def _retry_tracker():
-        return {"count": 0, "last_error_type": "", "last_error_details": "", "error_history": []}
-
     return {
         "prompt": prompt,
         "auto_destroy": auto_destroy,
@@ -137,17 +136,19 @@ def build_initial_state(prompt: str,
             else int(os.environ.get("TF_PLAN_TIMEOUT", "120")),
         "infrastructure_plan": {},
         "security_profile": {},
+        "security_status": "ok",
         "generated_code": "",
         "fix_feedback": {},
         "deployment_result": {},
         "retries": {
-            "val_eng":    _retry_tracker(),
-            "val_arch":   _retry_tracker(),
-            "deploy_eng": _retry_tracker(),
-            "deploy_arch": _retry_tracker(),
-            "sec":        _retry_tracker(),
+            "val_eng":    new_tracker(),
+            "val_arch":   new_tracker(),
+            "deploy_eng": new_tracker(),
+            "deploy_arch": new_tracker(),
+            "sec":        new_tracker(),
         },
-        "total_attempts": 0,
+        "total_val_attempts": 0,
+        "total_deploy_attempts": 0,
         "routing_log": [],
         "arch_error_history": [],
         "eng_error_history": [],
@@ -184,5 +185,6 @@ if __name__ == "__main__":
     _retries = final.get("retries") or {}
     _deploy_retry = (_retries.get("deploy_eng", {}).get("count", 0) +
                      _retries.get("deploy_arch", {}).get("count", 0))
-    print(f"total_attempts: {final.get('total_attempts', 0)}  deploy_retry: {_deploy_retry}")
+    print(f"total_val_attempts: {final.get('total_val_attempts', 0)}  "
+          f"total_deploy_attempts: {final.get('total_deploy_attempts', 0)}  deploy_retry: {_deploy_retry}")
     print(f"routing_log: {len(final['routing_log'])} entries")

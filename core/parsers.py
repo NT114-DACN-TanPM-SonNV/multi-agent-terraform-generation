@@ -6,6 +6,11 @@ Tách riêng khỏi errors.py vì parse logic không phải error handling —
 import json
 import re
 
+# Tách ("type", "name") từ resource declaration trong HCL: `resource "type" "name"`.
+# Dùng chung A3 (engineering, đếm resource sinh ra) và A4 (validation, label cho LLM
+# classify). Trước đây định nghĩa trùng ở cả hai file.
+RESOURCE_DECL_RE = re.compile(r'resource\s+"([^"]+)"\s+"([^"]+)"')
+
 
 def strip_code_block(raw: str) -> str:
     """Xóa markdown code fence mà LLM hay bọc quanh JSON/HCL dù đã dặn không làm vậy.

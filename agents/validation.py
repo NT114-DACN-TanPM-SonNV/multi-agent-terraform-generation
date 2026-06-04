@@ -1,41 +1,8 @@
-"""Agent 4 — Validation / Testing (validation_node)
+"""Agent 4 — Validation: terraform init → validate → plan → Checkov gate.
 
-Validate + plan generated HCL. Flow: terraform init → validate → plan → Checkov gate.
-
-Workflow:
-  1. terraform init: tải provider, setup working directory
-  2. terraform validate: static syntax check
-  3. terraform plan -out=tfplan.out: logical check + lưu plan file
-  4. terraform show -json tfplan.out: chuyển plan sang JSON để Checkov scan chính xác hơn
-  5. Checkov gate (nếu plan pass): enforce CKV IDs mà A2 chọn, scan trên plan JSON
-  6. Route: deployment (success) hoặc retry agents (failure)
-
-Error Classification (Hybrid — Pattern + LLM):
-  - SYNTAX: terraform validate fail → TẤT ĐỊNH → route engineering (A3)
-  - LOGIC: terraform plan fail + LLM phân loại → route engineering (A3)
-  - MISSING_RESOURCE: plan fail + "not found" pattern → TẤT ĐỊNH → route architecture (A1)
-  - SECURITY: Checkov check fail → TẤT ĐỊNH → route engineering (A3) hay best-effort deploy
-  - INFRASTRUCTURE: timeout/connection pattern → TẤT ĐỊNH → route requires_human
-  - (PASS): tất cả check pass → route deployment (A5)
-
-Security Gate:
-  - Enforce đúng tập CKV IDs mà A2 chọn per resource (grounded bằng catalog menu)
-  - Scan trên plan JSON (terraform show -json) → chính xác hơn source scan
-  - Fallback về source scan nếu plan JSON không khả dụng
-  - Nếu fail + có budget → retry A3 (max 2 lần, retries["sec"])
-  - Nếu fail + hết budget → best-effort deploy + ghi unmet_checks
-
-Input: state["generated_code"], state["infrastructure_plan"], state["security_profile"]
-Output: state["fix_feedback"] (success/error), state["retries"] (retry tracking)
-
-Retry logic:
-  - SYNTAX/LOGIC/SECURITY: retries["val_eng"] max 3
-  - MISSING_RESOURCE:      retries["val_arch"] max 2
-  - INFRASTRUCTURE: 1 lần retry terraform plan transient (inside node, không qua graph)
-  - Oscillation detection: 3 lỗi cùng loại / xoay vòng 2-3 loại → requires_human
-
-Note: Full Checkov scoring là score.py's job (independent full scan).
-      A4 chỉ enforce tập check A2 đã chọn để hướng A3 fix.
+Error types: SYNTAX (validate) | LOGIC/MISSING_RESOURCE (plan, hybrid pattern+LLM)
+| SECURITY (Checkov, best-effort nếu hết budget) | INFRASTRUCTURE (timeout/auth).
+Checkov scan trên plan JSON (terraform show -json) — chính xác hơn source scan.
 """
 import json
 import logging
@@ -46,57 +13,48 @@ from pathlib import Path
 
 from core.state import AgentState
 from core.llm import call_llm
-from core.parsers import parse_llm_json
+from core.parsers import parse_llm_json, RESOURCE_DECL_RE as _RESOURCE_DECL_RE
 from core.catalog import get_check_names
 from core.terraform import (
     run_terraform, write_terraform_dir, terraform_workdir,
-    run_checkov_on_hcl, run_checkov_on_plan,
+    run_checkov_on_hcl, run_checkov_on_plan, tf_init_cmd,
 )
 from core.retry_control import (
-    increment_retry, check_retry_budget, detect_oscillation,
+    increment_retry, check_retry_budget,
     MAX_TOTAL_RETRY, MAX_VAL_ENG_RETRY, MAX_VAL_ARCH_RETRY, MAX_VAL_SEC_RETRY,
 )
-from core.errors import matches_any, MISSING_RESOURCE_PATTERNS
+from core.errors import matches_any, MISSING_RESOURCE_PATTERNS, AUTH_PATTERNS
 from prompts.validation import (
     SYSTEM_PROMPT as _SYSTEM_PROMPT,
     TOP_PROMPT as _TOP, BOTTOM_PROMPT as _BOTTOM,
-    SYNTAX_CONTEXT, FAILING_CODE_CONTEXT, SYNTAX_FIX_FALLBACK, INIT_FIX,
-    PLAN_CONTEXT, SECURITY_FIX,
+    INIT_FIX, PLAN_CONTEXT, SECURITY_FIX,
 )
 
 logger = logging.getLogger(__name__)
 
-# Regex tìm tất cả resource declarations trong HCL: `resource "type" "name"`
-_RESOURCE_DECL_RE = re.compile(r'resource\s+"([^"]+)"\s+"([^"]+)"')
-
-# Timeout (giây) cho từng terraform command.
-# init dài hơn vì phải download provider plugin (~300MB cho AWS).
-_INIT_TIMEOUT = 300
-# validate là static check (không cần network) → nhanh.
-_VALIDATE_TIMEOUT = 60
-
-# Retry budget thống nhất (đồng bộ với FRAMEWORK.md)
+_INIT_TIMEOUT     = 300
+_VALIDATE_TIMEOUT = 30
+_SHOW_TIMEOUT     = 15   # local file, no network
+# Ghi sau init thành công. Retry thấy marker → skip init (5-10s per cycle).
+# Không ghi khi fail → partial .terraform/ không bị reuse.
+_INIT_MARKER = ".tf_init_done"
 
 
 # ── Security gate catalog ──────────────────────────────────────────────────────
-# Thiết kế mới (không posture scalar):
-#   - A2 chọn trực tiếp CKV IDs per resource (grounded bằng catalog menu)
+# A2 chọn trực tiếp CKV IDs per resource (grounded bằng catalog menu).
 #   - _targets_for_plan chỉ đọc profile["checks"] — không cần level/tier trung gian
-#   - _load_check_names dùng để render fix_instruction human-readable cho A3
+#   - get_check_names() render fix_instruction human-readable cho A3 (id → tên check)
 #
-# Đường dẫn đến 2 catalog file:
-#   .check_targets.json: single-resource checks (CKV_AWS_*)
-#   .check_graph.json:   graph checks (CKV2_AWS_*)
+# Nguồn tên check: core/catalog.json (sinh bởi core/build_catalog.py).
 _CKV_NAME: dict[str, str] = get_check_names()
 
 
 def _targets_for_plan(profile: dict) -> tuple[set[str], dict[str, set[str]]]:
     """Từ security_profile A2 → tập CKV ID cần verify, toàn cục + theo từng resource addr.
 
-    Thiết kế mới (bỏ posture scalar):
-      - A2 đã chọn trực tiếp CKV IDs per resource (grounded bằng catalog menu + FLOOR)
+    A2 đã chọn trực tiếp CKV IDs per resource (grounded bằng catalog menu).
       - Hàm này chỉ đọc profile["checks"] và build per_res + global_ids
-      - Không cần level/tier/posture_level trung gian nữa
+      - Không có level/tier trung gian: profile là nguồn target duy nhất
 
     Returns:
         global_ids: tập tất cả IDs cần pass vào run_checkov_on_hcl
@@ -128,19 +86,11 @@ _PLAN_TRANSIENT_PATTERNS = (
     "tls handshake timeout", "requesttimeout",
     "throttling", "requestlimitexceeded", "rate exceeded", "limitexceeded",
 )
-_PLAN_AUTH_PATTERNS = (
-    "no valid credential", "nocredentialproviders", "could not load credentials",
-    "expired token", "invalidclienttokenid", "authfailure",
-    "unauthorizedoperation", "accessdenied", "requesterror",
-    "failed to instantiate provider", "could not load plugin",
-)
+_PLAN_AUTH_PATTERNS = AUTH_PATTERNS   # canonical set từ core.errors — sync với A5
 _PLAN_INFRA_PATTERNS = _PLAN_TRANSIENT_PATTERNS + _PLAN_AUTH_PATTERNS
 
-# Retry terraform plan tối đa 1 lần nếu gặp transient error.
-# Plan là read-only/idempotent → retry rẻ, không tốn state.
-# Lý do giới hạn 1: nếu transient vẫn xảy ra sau 1 retry → infra issue, không nên spam.
 _MAX_PLAN_TRANSIENT_RETRY = 1
-_PLAN_RETRY_BACKOFF = 3  # giây chờ giữa các retry (tăng theo attempt để giảm tải)
+_PLAN_RETRY_BACKOFF = 3
 
 
 def _hcl_resource_labels(code: str) -> list[str]:
@@ -150,17 +100,8 @@ def _hcl_resource_labels(code: str) -> list[str]:
 
 def _extract_code_context(validate_err: str, code: str, window: int = 4,
                           max_errors: int = 6) -> str:
-    """Trích đoạn code xung quanh các dòng lỗi để LLM classify SYNTAX error.
-
-    Terraform validate báo lỗi theo format "on main.tf line N" → parse line number.
-    Lấy window=4 dòng trước/sau dòng lỗi → LLM thấy đủ context để hiểu vấn đề.
-    Marker ">>>" đánh dấu dòng lỗi chính xác.
-    max_errors=6 để tránh prompt quá dài khi có nhiều lỗi đồng thời.
-
-    Tại sao dùng re.finditer thay vì re.search?
-      re.search chỉ lấy lỗi ĐẦU TIÊN → nếu file có 3 lỗi, LLM chỉ thấy 1 → fix 1 → retry →
-      fix tiếp... = whack-a-mole (cạn budget trước khi fix hết). finditer lấy tất cả lỗi
-      → LLM sửa hết trong 1 lần → tiết kiệm retry budget.
+    """Trích lines xung quanh mỗi dòng lỗi, đánh dấu ">>>". finditer để lấy hết
+    tất cả lỗi một lần — A3 sửa được hết trong 1 vòng thay vì whack-a-mole.
     """
     line_nums: list[int] = []
     seen: set[int] = set()
@@ -183,70 +124,35 @@ def _extract_code_context(validate_err: str, code: str, window: int = 4,
             marker = ">>>" if i == line_num else "   "
             parts.append(f"{i:3d} {marker} {ln}")
         blocks.append("\n".join(parts))
-    # Ngăn cách các block bằng "---" để LLM biết đây là các vị trí lỗi độc lập
     return "\n---\n".join(blocks)
 
 
-def _error_signature(error_type: str, text: str) -> list:
-    """Trích danh sách error message ngắn gọn — dùng để phát hiện oscillation.
-
-    Oscillation: A3 sửa, A4 fail đúng cùng lỗi → A3 lại sửa → loop vô hạn.
-    detect_oscillation() so sánh signatures: nếu 3 lần liên tiếp cùng signature → dừng.
-    Dedup + sort để signature ổn định (không thay đổi theo thứ tự xuất hiện).
-    Truncate 80 ký tự mỗi lỗi → tránh signature quá dài, khó so sánh.
-    """
-    errs = re.findall(r"Error:\s*(.+)", text or "")
-    sig = sorted({e.strip()[:80] for e in errs})
-    return sig or [((text or "").strip()[:80] or error_type)]
-
-
 def _success_result(checkov: dict, unmet: list | None = None,
-                    phantom: list | None = None) -> dict:
-    """Tạo fix_feedback cho trường hợp validation PASS.
-
-    overall_passed=True: pipeline đã validate + plan OK → cho phép route về A5.
-    unmet_checks: security check chưa đạt nhưng hết retry budget → báo cáo, không block.
-    phantom_checks: check được target nhưng Checkov không trigger (resource không tồn tại
-                    hoặc companion resource thiếu) → không phải fail, nhưng cần monitor.
-
-    Tại sao unmet không block?
-      Triết lý "working IaC": code chạy được > code không deploy được + security cao hơn.
-      Nếu block: A3 không thể fix check impossible (vd CKV_AWS_145 cần companion resource
-      không được phép thêm) → pipeline stuck → không có deliverable. Báo cáo tốt hơn block.
-    """
+                    phantom: list | None = None,
+                    security_degraded: bool = False) -> dict:
+    # unmet không block: impossible checks (companion resource không được thêm) sẽ
+    # stuck pipeline mà không có deliverable. Best-effort + báo cáo tốt hơn block cứng.
     return {
         "fix_feedback": {
             "overall_passed": True, "error_type": None, "root_cause": None,
             "fix_instruction": None, "checkov": checkov,
             "unmet_checks": [{"resource": a, "ckv_id": i, "name": n} for a, i, n in (unmet or [])],
             "phantom_checks": list(phantom or []),
+            "security_degraded": security_degraded,
             "validate_passed": True, "plan_passed": True,
         },
     }
 
 
 def _enforceable_unmet(per_res: dict[str, set[str]], checkov: dict) -> list[tuple[str, str, str]]:
-    """Tìm check thực sự bị vi phạm — failed VÀ nằm trong tập target của resource đó.
-
-    Logic join:
-      failed_per_resource: [(addr, ckv_id)] — Checkov báo fail
-      per_res:             {addr → set(ids)} — tập A4 muốn enforce cho addr đó
-      unmet = intersection: check vừa fail vừa được target
-
-    Tại sao cần per_res thay vì chỉ kiểm failed_ckv_ids?
-      Ví dụ: Checkov fail CKV_AWS_18 (S3 access logging) trên aws_s3_bucket.main.
-      Nếu posture = standard: _targets_for_plan không include CKV_AWS_18 (level 2, strict only).
-      → Không phải unmet → không cần A3 fix → không block → đúng.
-      Nếu posture = strict: _targets_for_plan include CKV_AWS_18 → unmet → A3 phải fix.
-
-    Dedup (seen set): Checkov đôi khi báo cùng (addr, id) nhiều lần nếu resource xuất hiện
-    trong nhiều context → dedup để fix_instruction không repeat cùng check.
+    """Intersection: check vừa fail (Checkov) vừa được A2 target cho resource đó.
+    Checkov có thể báo cùng (addr, id) nhiều lần → dedup.
     """
     unmet: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for addr, ckv_id in checkov.get("failed_per_resource", []):
         if ckv_id not in per_res.get(addr, ()):
-            continue  # check fail nhưng không phải target của resource này → bỏ qua
+            continue
         key = (addr, ckv_id)
         if key in seen:
             continue
@@ -257,18 +163,10 @@ def _enforceable_unmet(per_res: dict[str, set[str]], checkov: dict) -> list[tupl
 
 def _security_return(state: AgentState, unmet: list[tuple[str, str, str]],
                      checkov: dict, phantom: list | None = None) -> dict:
-    """Tạo fix_feedback khi Checkov fail và còn budget retry.
-
-    Route: SECURITY → engineering (A3 sửa attributes/companion resources).
-    Budget riêng MAX_VAL_SEC_RETRY = 2 (tách khỏi MAX_VAL_ENG_RETRY để SECURITY
-    không ăn budget của SYNTAX/LOGIC — hai loại lỗi độc lập, không nên dùng chung budget).
-
-    fix_instruction format: "- addr: check_name" (ngôn ngữ người, không chỉ ID).
-    Tại sao cần tên check?
-      CKV_AWS_145 không nói được A3 cần làm gì. "Ensure S3 bucket has encryption enabled"
-      thì rõ ràng hơn rất nhiều. A3 nhận tên → tra best practice → implement đúng.
+    """Checkov fail + còn budget → route SECURITY về A3. fix_instruction dùng tên check
+    (không chỉ ID) để A3 hiểu được cần implement gì.
     """
-    new_total = state["total_attempts"] + 1
+    new_total = state["total_val_attempts"] + 1
     increment_retry(state, "sec", "SECURITY", str(sorted({cid for _a, cid, _n in unmet})))
     fix_instruction = SECURITY_FIX.format(
         items="\n".join(f"- {addr}: {name}" for addr, _id, name in unmet)
@@ -285,7 +183,7 @@ def _security_return(state: AgentState, unmet: list[tuple[str, str, str]],
             "validate_passed": True, "plan_passed": True,
         },
         "retries": state["retries"],
-        "total_attempts": state["total_attempts"],
+        "total_val_attempts": state["total_val_attempts"],
         "routing_log": state["routing_log"] + [{
             "round": new_total, "error_type": "SECURITY", "root_cause": "engineering",
             "fix_instruction": fix_instruction, "predicted_route": "engineering",
@@ -295,16 +193,9 @@ def _security_return(state: AgentState, unmet: list[tuple[str, str, str]],
 
 def _infra_return(state: AgentState, fix_instruction: str, checkov: dict,
                   validate_passed: bool, plan_passed: bool, raw_error: str = "") -> dict:
-    """Tạo fix_feedback khi gặp lỗi INFRASTRUCTURE (timeout, auth, network).
-
-    INFRASTRUCTURE không route retry — không có gì để sửa ở code level.
-    Route thẳng requires_human: người cần kiểm tra AWS credentials, network, quota.
-    Vẫn ghi routing_log để audit trail.
-    """
-    # INFRASTRUCTURE → requires_human (terminal). Chỉ bump total_attempts (global backstop),
-    # KHÔNG increment per-agent counter — tránh nhiễu error_history dùng cho oscillation detection.
-    state["total_attempts"] += 1
-    new_total = state["total_attempts"]
+    # Chỉ bump total_val_attempts — không increment per-agent counter (tránh nhiễu error_history).
+    state["total_val_attempts"] += 1
+    new_total = state["total_val_attempts"]
     logger.info("Agent 4: INFRASTRUCTURE — %s", fix_instruction[:80])
     return {
         "fix_feedback": {
@@ -314,7 +205,7 @@ def _infra_return(state: AgentState, fix_instruction: str, checkov: dict,
             "validate_passed": validate_passed, "plan_passed": plan_passed,
         },
         "retries": state["retries"],
-        "total_attempts": state["total_attempts"],
+        "total_val_attempts": state["total_val_attempts"],
         "routing_log": state["routing_log"] + [{
             "round": new_total, "error_type": "INFRASTRUCTURE", "root_cause": None,
             "fix_instruction": fix_instruction, "predicted_route": "requires_human",
@@ -324,7 +215,7 @@ def _infra_return(state: AgentState, fix_instruction: str, checkov: dict,
 
 def _fail_return(state: AgentState, error_type: str, root_cause: str,
                  fix_instruction: str, checkov: dict, validate_passed: bool,
-                 plan_passed: bool, signature: list, raw_error: str = "") -> dict:
+                 plan_passed: bool, raw_error: str = "") -> dict:
     """Tạo fix_feedback cho SYNTAX, LOGIC, MISSING_RESOURCE errors.
 
     Là hàm chung cho cả 3 loại lỗi "fixable":
@@ -333,9 +224,11 @@ def _fail_return(state: AgentState, error_type: str, root_cause: str,
       - MISSING_RESOURCE: resource type không tồn tại → A1 re-plan
 
     Tracking: increment "val_eng" cho SYNTAX/LOGIC, "val_arch" cho MISSING_RESOURCE.
-    routing_log: append entry để audit trail, oscillation detection.
+    routing_log: append entry để audit trail.
     """
-    new_total = state["total_attempts"] + 1
+    assert error_type in ("SYNTAX", "LOGIC", "MISSING_RESOURCE"), \
+        f"_fail_return: unexpected error_type '{error_type}'"
+    new_total = state["total_val_attempts"] + 1
     is_eng  = error_type in ("SYNTAX", "LOGIC")
     is_arch = error_type == "MISSING_RESOURCE"
 
@@ -352,7 +245,7 @@ def _fail_return(state: AgentState, error_type: str, root_cause: str,
             "validate_passed": validate_passed, "plan_passed": plan_passed,
         },
         "retries": state["retries"],
-        "total_attempts": state["total_attempts"],
+        "total_val_attempts": state["total_val_attempts"],
         "routing_log": state["routing_log"] + [{
             "round": new_total, "error_type": error_type, "root_cause": root_cause,
             "fix_instruction": fix_instruction, "predicted_route": root_cause,
@@ -395,8 +288,77 @@ def _llm_classify(context: str, allowed_types: set,
     et = parsed.get("error_type")
     if et not in allowed_types:
         et = default_type
-    fix = str(parsed.get("fix_instruction") or default_fix)[:500]
+    fix = str(parsed.get("fix_instruction") or default_fix)[:1500]
     return et, _root(et), fix
+
+
+def _extract_failing_resource_body(plan_err: str, code: str) -> str:
+    """Trích HCL body của resource(s) xuất hiện trong plan error.
+
+    LLM classify PLAN lỗi không thấy code hiện tại — chỉ thấy error text + label list.
+    Cung cấp full block giúp LLM biết resource đang có gì, cần thêm/sửa attribute nào.
+    Giới hạn 2 resource và 600 chars để tránh token bloat.
+    """
+    error_labels = [f"{t}.{n}" for t, n in _RESOURCE_DECL_RE.findall(plan_err)]
+    if not error_labels:
+        return ""
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for label in error_labels:
+        if label in seen or len(blocks) >= 2:
+            break
+        seen.add(label)
+        dot = label.find(".")
+        if dot < 0:
+            continue
+        rtype, rname = label[:dot], label[dot + 1:]
+        opener = re.compile(
+            rf'resource\s+"({re.escape(rtype)})"\s+"({re.escape(rname)})"\s*\{{',
+            re.MULTILINE,
+        )
+        m = opener.search(code)
+        if not m:
+            continue
+        start, depth = m.start(), 0
+        for i, ch in enumerate(code[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(code[start : i + 1])
+                    break
+    if not blocks:
+        return ""
+    body = "\n\n".join(blocks)
+    if len(body) > 600:
+        body = body[:600] + "\n  ... (truncated)"
+    return f"CURRENT HCL OF AFFECTED RESOURCE(S):\n{body}\n\n"
+
+
+def _format_prev_fixes(state: AgentState) -> str:
+    """Render fix_instruction text từ eng_error_history để bơm vào LLM classify context.
+
+    Tại sao cần?
+    error_history trong RetryTracker chỉ lưu error_type string (["SYNTAX","SYNTAX"]) —
+    đủ để LLM biết có bao nhiêu lần fail và loại gì, nhưng KHÔNG đủ để LLM biết nội
+    dung fix nào đã được thử và vẫn sai. Hệ quả: LLM có thể generate lại đúng fix cũ
+    (ROW 7 round 4 lặp lại password-length fix của round 1).
+
+    eng_error_history lưu fix_instruction text đầy đủ — build section này để LLM tránh
+    tái tạo fix đã thất bại và tập trung vào lỗi còn lại.
+
+    Returns empty string nếu không có lịch sử (lần đầu A4 chạy).
+    """
+    hist = (state.get("eng_error_history") or [])[-2:]
+    if not hist:
+        return ""
+    lines = ["PREVIOUSLY ATTEMPTED FIXES (already tried — do NOT repeat these):"]
+    for i, e in enumerate(hist, 1):
+        fix = (e.get("fix_instruction") or "")[:300].strip()
+        if fix:
+            lines.append(f"  {i}. {fix}")
+    return "\n".join(lines) + "\n"
 
 
 def validation_node(state: AgentState) -> dict:
@@ -412,37 +374,44 @@ def validation_node(state: AgentState) -> dict:
         return _fail_return(
             state, "MISSING_RESOURCE", "architecture",
             "generated_code rỗng — Engineering agent không sinh được HCL.",
-            _no_checkov, False, False, ["empty_code"],
+            _no_checkov, False, False,
         )
 
     run_dir = state.get("run_dir") or ""
     # files_dir: thư mục chứa stub files (Lambda zip, etc.) để write_terraform_dir copy vào
     files_dir = (Path(run_dir) / "files") if run_dir else None
 
-    with terraform_workdir(run_dir or None, "a4") as d:
+    # reuse=True: giữ .terraform/ từ iteration trước (A4 retry trong cùng run_dir).
+    # A3 không thay đổi required_providers → lock file/provider binary vẫn valid.
+    with terraform_workdir(run_dir or None, "a4", reuse=bool(run_dir)) as d:
         # Ghi HCL + stubs vào working directory (main.tf + stub files cho Lambda/S3)
         write_terraform_dir(d, code, files_dir=files_dir)
 
         # ── terraform init ─────────────────────────────────────────────────────
-        # init tải AWS provider plugin (~300MB) → timeout dài (300s).
-        # Nếu timeout: INFRA error (network/slow download, không phải code bug).
-        # Nếu returncode != 0 với "Invalid" prefix: có thể là SYNTAX trong provider block → A3 fix.
-        try:
-            init = run_terraform(["terraform", "init", "-no-color"], d, _INIT_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            return _infra_return(state, f"terraform init timed out (>{_INIT_TIMEOUT}s)", _no_checkov, False, False)
-        if init.returncode != 0:
-            init_err = ((init.stderr or "") + "\n" + (init.stdout or "")).strip()
-            # "problems with the configuration" / "Error: Invalid" = code syntax issue
-            if "problems with the configuration" in init_err or init_err.startswith("Error: Invalid"):
-                sig = _error_signature("SYNTAX", init_err)
-                return _fail_return(
-                    state, "SYNTAX", "engineering",
-                    INIT_FIX.format(err=init_err[:600]),
-                    _no_checkov, False, False, sig, raw_error=init_err[:2000],
-                )
-            # Còn lại: provider download fail, network issue, plugin cache issue → INFRA
-            return _infra_return(state, f"terraform init failed: {init_err[:500]}", _no_checkov, False, False, raw_error=init_err[:2000])
+        # Skip nếu marker tồn tại = init thành công ở iteration trước.
+        # Marker chỉ được ghi sau init thành công (không ghi nếu fail) → partial
+        # .terraform/ từ failed init sẽ KHÔNG bị reuse.
+        _marker = Path(d) / _INIT_MARKER
+        if _marker.exists():
+            logger.info("Agent 4: reusing previous init — skip terraform init")
+        else:
+            try:
+                init = run_terraform(tf_init_cmd(), d, _INIT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                return _infra_return(state, f"terraform init timed out (>{_INIT_TIMEOUT}s)", _no_checkov, False, False)
+            if init.returncode != 0:
+                init_err = ((init.stderr or "") + "\n" + (init.stdout or "")).strip()
+                # "problems with the configuration" / "Error: Invalid" = code syntax issue
+                if "problems with the configuration" in init_err or init_err.startswith("Error: Invalid"):
+                    return _fail_return(
+                        state, "SYNTAX", "engineering",
+                        INIT_FIX.format(err=init_err[:600]),
+                        _no_checkov, False, False, raw_error=init_err[:2000],
+                    )
+                # Còn lại: provider download fail, network issue, plugin cache issue → INFRA
+                return _infra_return(state, f"terraform init failed: {init_err[:500]}", _no_checkov, False, False, raw_error=init_err[:2000])
+            # Init thành công — ghi marker để iteration sau skip re-init
+            _marker.write_text("")
 
         # ── terraform validate ─────────────────────────────────────────────────
         # Static check: không cần network, không gọi AWS API.
@@ -455,28 +424,16 @@ def validation_node(state: AgentState) -> dict:
 
         if val.returncode != 0:
             validate_err = (val.stderr or val.stdout or "").strip()
-            sig = _error_signature("SYNTAX", validate_err)
             logger.info("Agent 4: FAIL SYNTAX (validate)")
-            # Trích code context (lines xung quanh dòng lỗi) cho LLM → fix chính xác hơn
-            code_ctx = _extract_code_context(validate_err, code)
-            code_block = FAILING_CODE_CONTEXT.format(code_ctx=code_ctx) if code_ctx else ""
-            # Build LLM context với full error + code context + resource labels + lịch sử lỗi
-            # Lịch sử lỗi (error_history) từ retries["val_eng"] — tránh LLM lặp lại sai lầm cũ
-            eng_history = (state.get("retries") or {}).get("val_eng", {}).get("error_history", [])
-            syntax_ctx = _TOP + SYNTAX_CONTEXT.format(
-                validate_err=validate_err[:2500],
-                code_context=code_block,
-                labels=_hcl_resource_labels(code),
-                history=json.dumps(eng_history[-2:]),
-            ) + _BOTTOM
-            # LLM classify với allowed_types={"SYNTAX"} — validate chỉ biết syntax
-            _, _, fix = _llm_classify(
-                syntax_ctx, {"SYNTAX"}, "SYNTAX",
-                SYNTAX_FIX_FALLBACK.format(err=validate_err[:600])
-            )
+            # Không cần LLM classify cho SYNTAX — validate error đã có line number +
+            # attribute name đủ để A3 fix trực tiếp. Tiết kiệm ~3-5s per SYNTAX retry.
+            code_ctx = _extract_code_context(validate_err, code, window=8, max_errors=4)
+            fix = "terraform validate failed — fix ALL errors in ONE revision:\n" + validate_err[:1500]
+            if code_ctx:
+                fix += "\n\nFAILING CODE (>>> = error line):\n" + code_ctx
             return _fail_return(
                 state, "SYNTAX", "engineering", fix,
-                _no_checkov, False, False, sig, raw_error=validate_err[:2000])
+                _no_checkov, False, False, raw_error=validate_err[:2000])
 
         # ── terraform plan ─────────────────────────────────────────────────────
         # -out=tfplan.out: lưu binary plan để terraform show -json bên dưới.
@@ -503,7 +460,7 @@ def validation_node(state: AgentState) -> dict:
         plan_json_str: str | None = None
         if plan_passed:
             try:
-                show = run_terraform(["terraform", "show", "-json", "tfplan.out"], d, 60)
+                show = run_terraform(["terraform", "show", "-json", "tfplan.out"], d, _SHOW_TIMEOUT)
                 if show.returncode == 0 and show.stdout:
                     plan_json_str = show.stdout
             except Exception as e:
@@ -517,8 +474,24 @@ def validation_node(state: AgentState) -> dict:
         profile = state.get("security_profile") or {}
         target_ids, per_res = _targets_for_plan(profile)
         if not target_ids:
-            logger.info("Agent 4: PASS (no security target)")
-            return _success_result(_no_checkov)
+            # Phân biệt "A2 chủ động chọn 0 check" vs "A2 hỏng (degraded)".
+            # Cả hai đều không block (triết lý working-IaC), nhưng degraded phải
+            # được đánh dấu — nếu không, một lần LLM A2 timeout sẽ thành PASS thầm
+            # với 0 security enforcement.
+            degraded = state.get("security_status") == "degraded"
+            if degraded:
+                logger.warning("Agent 4: security gate SKIPPED — A2 degraded (LLM fail), KHÔNG phải intent")
+            else:
+                logger.info("Agent 4: PASS (no security target)")
+            result = _success_result(_no_checkov, security_degraded=degraded)
+            if degraded:
+                result["routing_log"] = state["routing_log"] + [{
+                    "round": state["total_val_attempts"],
+                    "error_type": None, "root_cause": None,
+                    "fix_instruction": "security gate bypassed — A2 degraded",
+                    "predicted_route": "deployment",
+                }]
+            return result
 
         try:
             if plan_json_str:
@@ -572,27 +545,29 @@ def validation_node(state: AgentState) -> dict:
     if matches_any(plan_err, MISSING_RESOURCE_PATTERNS):
         error_type, root_cause = "MISSING_RESOURCE", "architecture"
         fix_instruction = f"terraform plan: resource not found or unsupported: {plan_err[:300]}"
-        sig = _error_signature(error_type, plan_err)
         logger.info("Agent 4: FAIL MISSING_RESOURCE (plan pattern)")
         return _fail_return(state, error_type, root_cause, fix_instruction,
-                            _no_checkov, True, False, sig, raw_error=plan_err[:2000])
+                            _no_checkov, True, False, raw_error=plan_err[:2000])
 
     # LLM classify: lỗi plan không khớp pattern nào → LLM phán LOGIC hay MISSING_RESOURCE
     # Cung cấp: full error text + resource labels + lịch sử lỗi (tránh lặp lại sai lầm)
     eng_history = (state.get("retries") or {}).get("val_eng", {}).get("error_history", [])
+    prev_fixes_str = _format_prev_fixes(state)
+    failing_body = _extract_failing_resource_body(plan_err, code)
     ctx = _TOP + PLAN_CONTEXT.format(
         plan_err=plan_err[:1500],
         labels=_hcl_resource_labels(code),
+        failing_resource_body=failing_body,
         history=json.dumps(eng_history[-3:]),
+        prev_fixes=prev_fixes_str,
     ) + _BOTTOM
     error_type, root_cause, fix_instruction = _llm_classify(
         ctx, {"LOGIC", "MISSING_RESOURCE"}, "LOGIC",
         f"terraform plan failed: {plan_err[:300]}")
-    sig = _error_signature(error_type, plan_err)
     logger.info("Agent 4: FAIL %s (plan)", error_type)
 
     return _fail_return(state, error_type, root_cause, fix_instruction,
-                        _no_checkov, True, False, sig, raw_error=plan_err[:2000])
+                        _no_checkov, True, False, raw_error=plan_err[:2000])
 
 
 def route_after_validation(state: AgentState) -> str:
@@ -600,12 +575,12 @@ def route_after_validation(state: AgentState) -> str:
 
     Thứ tự kiểm tra:
       1. overall_passed            → deployment
-      2. total_attempts >= 5       → requires_human  (global backstop)
+      2. total_val_attempts >= 5       → requires_human  (validation-phase backstop; deploy
+                                      phase dùng total_deploy_attempts riêng ở route_after_deployment)
       3. INFRASTRUCTURE            → requires_human
       4. root_cause invalid        → requires_human
-      5. Oscillation (per counter) → requires_human
-      6. Budget check (trừ SECURITY — đã check in-node) → requires_human nếu cạn
-      7. Route: root_cause "engineering" → A3 | "architecture" → A1
+      5. Budget check (trừ SECURITY — đã check in-node) → requires_human nếu cạn
+      6. Route: root_cause "engineering" → A3 | "architecture" → A1
     """
     # ── Pass: route deployment ─────────────────────────────────────────────────
     if state["fix_feedback"]["overall_passed"]:
@@ -613,8 +588,8 @@ def route_after_validation(state: AgentState) -> str:
 
     error_type = state["fix_feedback"]["error_type"]
 
-    if state["total_attempts"] >= MAX_TOTAL_RETRY:
-        logger.info("Route: max total attempts (%d >= %d)", state["total_attempts"], MAX_TOTAL_RETRY)
+    if state["total_val_attempts"] >= MAX_TOTAL_RETRY:
+        logger.info("Route: max total attempts (%d >= %d)", state["total_val_attempts"], MAX_TOTAL_RETRY)
         return "requires_human"
 
     if error_type == "INFRASTRUCTURE":
@@ -626,12 +601,6 @@ def route_after_validation(state: AgentState) -> str:
     agent = _AGENT.get(root_cause)
     if agent is None:
         logger.error("Route: invalid root_cause '%s' — requires_human", root_cause)
-        return "requires_human"
-
-    # SECURITY dùng "sec" counter, không phải "val_eng"
-    _osc_agent = "sec" if error_type == "SECURITY" else agent
-    if detect_oscillation(state, _osc_agent, error_type):
-        logger.info("Route: oscillation (%s) — requires_human", _osc_agent)
         return "requires_human"
 
     # SECURITY: budget check xảy ra in-node (validation_node dùng sec counter + best-effort logic).

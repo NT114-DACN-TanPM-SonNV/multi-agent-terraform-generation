@@ -1,76 +1,31 @@
-"""Agent 5 — Deployment / Apply (deployment_node)
+"""Agent 5 — Deployment: terraform apply lên AWS.
 
-Thực thi terraform apply lên AWS infrastructure.
-Nếu fail → cleanup partial state (destroy) → phân loại lỗi → route.
-
-Workflow:
-  1. terraform init (timeout 60s)
-  2. terraform apply (timeout 360s)
-  3. Nếu success → optional auto-destroy (trong eval mode) → END
-  4. Nếu fail:
-     a. Cleanup: terraform refresh (best-effort) + terraform destroy
-     b. Phân loại lỗi (pattern-based trước, LLM fallback)
-     c. Route: retry A5 / route A3 / route A1 / requires_human
-
-Error Classification (Hybrid — Pattern + LLM):
-  - INFRASTRUCTURE: timeout/connection pattern → retry 1 lần in-node → requires_human
-  - LOGIC: apply fail + LLM phân loại → route engineering (A3) để patch code
-  - MISSING_RESOURCE: apply fail + "not found" pattern → route architecture (A1) để re-plan
-  - OTHER: PERMISSION / QUOTA / UNKNOWN → route requires_human (terminal)
-
-Cleanup Strategy:
-  - Khi apply timeout: terraform refresh (rebuild state từ AWS) rồi destroy
-  - Khi apply fail: list resources từ state → destroy (auto cleanup)
-  - Nếu destroy fail → requires_human (dirty state, cần manual intervention)
-
-Input: state["generated_code"], state["infrastructure_plan"], state["retries"]
-Output: state["deployment_result"] (success/error), state["fix_feedback"] (nếu retry A3/A1)
-
-Retry logic:
-  - INFRASTRUCTURE: retry 1 lần in-node (như A4) — không qua graph
-  - LOGIC: retries["deploy_eng"] max 2 (độc lập với A4)
-  - MISSING_RESOURCE: retries["deploy_arch"] max 2 (độc lập với A4)
-  - OTHER: không retry (terminal, cần human fix AWS setup)
-
-Auto-destroy (eval mode):
-  - Sau apply thành công, patch HCL (disable deletion_protection) rồi destroy
-  - Dùng trong batch evaluation để clean up test resources
+Fail → cleanup partial state (destroy) → phân loại → route.
+INFRASTRUCTURE: in-node retry 1 lần. LOGIC → A3. MISSING_RESOURCE → A1.
+OTHER/dirty state → requires_human. Auto-destroy sau apply trong eval mode.
 """
 import json
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 
-# Attributes ngăn AWS resource bị delete — phải disable trước khi terraform destroy.
-# Nếu không patch: destroy fail với "DeletionProtectionEnabled" hoặc tương tự.
-# Mỗi tuple: (regex_pattern, replacement_string) — áp qua re.sub theo thứ tự.
-# Thứ tự quan trọng: final_snapshot_identifier phải xử lý SAU skip_final_snapshot
-# vì chúng liên quan nhau.
+# Patch HCL trước khi destroy trong eval mode — tắt các attribute chặn delete API.
+# Thứ tự quan trọng: final_snapshot_identifier phải xử lý sau skip_final_snapshot.
 _DESTROY_PATCHES = [
-    # DynamoDB: deletion_protection_enabled=true chặn DeleteTable API
-    (r'(deletion_protection_enabled\s*=\s*)true', r'\g<1>false'),
-    # RDS / Aurora / DocumentDB / ALB: deletion_protection=true chặn DeleteDBInstance
-    (r'(deletion_protection\s*=\s*)true', r'\g<1>false'),
-    # RDS: skip_final_snapshot=false yêu cầu tạo snapshot trước khi xóa — eval không cần
-    (r'(skip_final_snapshot\s*=\s*)false', r'\g<1>true'),
-    # RDS/ElastiCache: final_snapshot_identifier conflicts với skip_final_snapshot=true
-    (r'\n[ \t]*final_snapshot_identifier\s*=\s*[^\n]+', ''),
-    # RDS: apply_immediately=false = change chỉ áp khi maintenance window → delay destroy
-    (r'(apply_immediately\s*=\s*)false', r'\g<1>true'),
-    # ElastiCache: automatic_failover_enabled=true cần multi-AZ → disable để destroy nhanh hơn
-    (r'(automatic_failover_enabled\s*=\s*)true', r'\g<1>false'),
-    (r'(multi_az_enabled\s*=\s*)true', r'\g<1>false'),
+    (r'(deletion_protection_enabled\s*=\s*)true',    r'\g<1>false'),  # DynamoDB
+    (r'(deletion_protection\s*=\s*)true',            r'\g<1>false'),  # RDS/ALB
+    (r'(skip_final_snapshot\s*=\s*)false',           r'\g<1>true'),   # RDS
+    (r'\n[ \t]*final_snapshot_identifier\s*=\s*[^\n]+', ''),          # RDS (conflicts với skip)
+    (r'(apply_immediately\s*=\s*)false',             r'\g<1>true'),   # RDS
+    (r'(automatic_failover_enabled\s*=\s*)true',     r'\g<1>false'),  # ElastiCache
+    (r'(multi_az_enabled\s*=\s*)true',               r'\g<1>false'),  # ElastiCache
 ]
 
 
 def _patch_for_destroy(code: str) -> str:
-    """Disable deletion-protection attrs để terraform destroy có thể thành công.
-
-    Chỉ dùng trong eval mode (auto_destroy=True). Production code không bao giờ gọi hàm này.
-    Áp patches tuần tự — thứ tự đảm bảo consistency giữa skip_final_snapshot và
-    final_snapshot_identifier (không thể tồn tại cùng nhau khi skip=true).
-    """
+    """Chỉ dùng trong eval mode (auto_destroy=True)."""
     for pattern, replacement in _DESTROY_PATCHES:
         code = re.sub(pattern, replacement, code)
     return code
@@ -79,12 +34,12 @@ def _patch_for_destroy(code: str) -> str:
 from core.state import AgentState
 from core.llm import call_llm
 from core.parsers import parse_llm_json
-from core.terraform import run_terraform, write_terraform_dir, terraform_workdir
+from core.terraform import run_terraform, write_terraform_dir, terraform_workdir, tf_init_cmd
 from core.retry_control import (
     increment_retry, check_retry_budget,
-    MAX_DEPLOY_ENG_RETRY, MAX_DEPLOY_ARCH_RETRY,
+    MAX_DEPLOY_TOTAL_RETRY, MAX_DEPLOY_ENG_RETRY, MAX_DEPLOY_ARCH_RETRY,
 )
-from core.errors import matches_any, MISSING_RESOURCE_PATTERNS
+from core.errors import matches_any, MISSING_RESOURCE_PATTERNS, AUTH_PATTERNS
 from prompts.deployment import SYSTEM_PROMPT as _SYSTEM_PROMPT
 from prompts.deployment import (
     TOP_PROMPT as _TOP, BOTTOM_PROMPT as _BOTTOM, CLASSIFY_CONTEXT,
@@ -92,44 +47,42 @@ from prompts.deployment import (
 
 logger = logging.getLogger(__name__)
 
-# Timeout constants — cân nhắc giữa tốc độ (ngắn) và tránh false timeout (dài).
-# init ngắn hơn A4 vì A5 chạy trên cùng machine đã có provider cache từ A4 → init nhanh hơn.
-_INIT_TIMEOUT = 60
-# apply timeout: 6 phút — đủ cho các resource chậm (ElastiCache, RDS) nhưng không vô hạn.
-_APPLY_TIMEOUT = 360
-# destroy timeout: 10 phút — ElastiCache replication group cần 5-10 phút để xóa.
-_DESTROY_TIMEOUT = 600
-# state list timeout: ngắn, chỉ đọc state file local.
+_INIT_TIMEOUT    = 60
+_APPLY_TIMEOUT   = 360
+_DESTROY_TIMEOUT = 600   # ElastiCache/RDS cần 5-10 phút để xóa
 _STATE_TIMEOUT = 30
 
-# Retry budgets cho các error type khác nhau.
+# In-node retry cho lỗi INFRASTRUCTURE (transient: network/throttle/quota tạm thời).
+# Đối xứng A4 (_MAX_PLAN_TRANSIENT_RETRY): retry 1 lần, có backoff trước khi thử lại.
+# Backoff để KHÔNG hammer API đang throttle (throttling/rate exceeded nằm trong
+# _INFRASTRUCTURE_PATTERNS) — A4 đã làm vậy, A5 trước đây retry tức thì (thiếu nhịp chờ).
+_MAX_APPLY_TRANSIENT_RETRY = 1
+_APPLY_RETRY_BACKOFF = 5  # giây chờ trước khi retry in-node
 
-# Patterns phân loại lỗi apply (tất định — không cần LLM).
-# Khác validation.py: A5 dùng bare "timeout"/"eof" vì apply output không có resource
-# attribute blocks — false-positive risk thấp hơn so với plan output.
-# VPC quota: thường gặp khi batch eval tạo nhiều VPC → retry sau khi cleanup.
+# Dùng cụm cụ thể (không bare "timeout"/"eof") vì apply output echo cả config HCL
+# có thể chứa `timeouts {}` hay heredoc "EOF" → false positive nếu dùng bare keyword.
 _INFRASTRUCTURE_PATTERNS = (
     "connection refused", "connection reset", "could not connect",
-    "timeout", "timed out", "i/o timeout", "eof", "no such host",
-    "dial tcp", "reset by peer", "context deadline exceeded",
+    "i/o timeout", "timed out", "context deadline exceeded",
+    "tls handshake timeout", "no such host", "dial tcp",
+    "reset by peer", "unexpected eof", "requesttimeout",
     "requestlimitexceeded", "throttling", "rate exceeded",
     "vpcquotaexceeded", "limitexceeded",
 )
 
+# Credential/permission errors → OTHER (terminal, no retry). "InsufficientInstanceCapacity"
+# không vào đây — đó là capacity transient, không phải permission.
+_PERMISSION_PATTERNS = AUTH_PATTERNS   # sync với A4 qua core.errors
+
 
 
 def _extract_error(stdout: str, stderr: str) -> str:
-    """Trích error text từ terraform apply output để LLM và pattern matching đọc.
-
-    Vấn đề: terraform ghi plan vào stdout (dài, nhiều noise) và error vào stderr (ngắn, quan trọng).
-    Nếu chỉ lấy tail của (stderr+stdout): stderr ngắn bị cắt mất bởi stdout dài.
-    Fix: giữ TOÀN BỘ stderr + 2000 ký tự cuối stdout → cả hai đều visible.
-    Thêm "--- Error lines ---" section: trích các dòng bắt đầu bằng "Error:" để LLM focus.
+    """stderr đầy đủ + tail của stdout (stderr ngắn bị cắt nếu chỉ lấy tail combined).
+    Thêm section "Error lines" để LLM focus.
     """
     stderr_clean = (stderr or "").strip()
     stdout_tail = (stdout or "")[-2000:]
     combined = (stderr_clean + "\n" + stdout_tail).strip()
-    # Trích dòng Error để LLM dễ identify root cause
     error_lines = [ln for ln in combined.splitlines() if re.match(r"\s*(?:Error|error):", ln)]
     if error_lines:
         return combined + "\n\n--- Error lines ---\n" + "\n".join(error_lines[-20:])
@@ -142,17 +95,18 @@ def _resource_labels(plan: dict) -> list[str]:
 
 
 def _guess_failed_resource(error_text: str, labels: list[str]) -> str | None:
-    """Đoán resource gây lỗi bằng string matching trong error text.
-
-    Cung cấp hint cho LLM: "failed_resource=aws_s3_bucket.main" → LLM focus vào
-    resource đó khi sinh fix_instruction, không cần đọc hết plan.
-    Match bằng type, name, hoặc full label (type.name) — type thường xuất hiện
-    trong error message AWS ("aws_db_instance resource not found").
-    Trả None nếu không tìm được → LLM nhận "unknown", vẫn hoạt động được.
+    """Match resource trong error text theo 3 tầng: full label → type → name (word-boundary,
+    len>3 để tránh "main"/"this" match bừa).
     """
     for label in labels:
-        rtype, rname = label.split(".", 1)
-        if rtype in error_text or rname in error_text or label in error_text:
+        if label in error_text:
+            return label
+    for label in labels:
+        if label.split(".", 1)[0] in error_text:
+            return label
+    for label in labels:
+        rname = label.split(".", 1)[1]
+        if len(rname) > 3 and re.search(rf"\b{re.escape(rname)}\b", error_text):
             return label
     return None
 
@@ -160,16 +114,7 @@ def _guess_failed_resource(error_text: str, labels: list[str]) -> str | None:
 def _deploy_result(success: bool, error_type: str | None, *, fix_instruction=None,
                    resources_created=None, partial_apply_destroyed=False,
                    destroy_failed=False, destroy_error=None, apply_raw_error=None) -> dict:
-    """Tạo deployment_result dict đồng nhất cho mọi outcome (success/failure).
-
-    Tại sao có destroy_failed field?
-      Nếu apply fail + destroy fail = dirty state (resources tồn tại trên AWS nhưng không
-      trong terraform state). Người phải cleanup thủ công → luôn route requires_human.
-      route_after_deployment kiểm tra dr["destroy_failed"] trước mọi check khác.
-
-    partial_apply_destroyed: apply bị interrupt nhưng destroy cleanup thành công.
-    Trạng thái này an toàn để retry (state clean).
-    """
+    # destroy_failed → dirty state → route_after_deployment force requires_human.
     return {
         "success": success,
         "error_type": error_type,
@@ -183,13 +128,7 @@ def _deploy_result(success: bool, error_type: str | None, *, fix_instruction=Non
 
 
 def _state_resources(tmpdir: str) -> list:
-    """List tất cả resource trong terraform state để biết apply đã tạo gì.
-
-    Dùng sau khi apply fail: nếu partial apply xảy ra (một số resource đã tạo),
-    danh sách này cho biết cần destroy gì để cleanup.
-    Timeout ngắn (30s) vì state list chỉ đọc local state file, không gọi AWS API.
-    Return [] nếu error hoặc timeout — caller vẫn chạy destroy (no-op nếu state rỗng).
-    """
+    """List resources trong terraform state — dùng để biết partial apply đã tạo gì."""
     try:
         r = run_terraform(["terraform", "state", "list"], tmpdir, _STATE_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -207,19 +146,9 @@ def _llm_classify_deploy(
     destroyed: bool,
     retry: int,
 ) -> tuple[str, str | None]:
-    """LLM phân loại error type từ apply fail + sinh fix_instruction.
+    """Phân loại apply error khi pattern matching không xác định được type.
+    Fallback về "OTHER" (terminal) nếu LLM fail — tránh loop LOGIC → A3 sai.
 
-    Chỉ gọi khi pattern-based classification không xác định được type (error_type=None).
-    Allowed types: LOGIC, MISSING_RESOURCE, OTHER (không phải INFRASTRUCTURE — đã check pattern trước).
-
-    Context cho LLM:
-      - labels: resource types trong plan (scope của problem)
-      - failed: resource đoán gây lỗi (focus point)
-      - error: full error text (cần thiết để classify đúng)
-      - partial/destroyed: state hiện tại (ảnh hưởng đến fix_instruction)
-      - retry: lần retry thứ mấy (LLM có thể đề xuất khác nhau ở lần 2)
-
-    Fallback: nếu LLM call fail hoặc parse fail → "OTHER" (terminal, safe default).
     Tại sao OTHER thay vì LOGIC?
       LOGIC route A3 có thể loop vô hạn nếu LLM classify sai liên tục.
       OTHER route requires_human — conservative hơn, đảm bảo người can thiệp.
@@ -246,6 +175,41 @@ def _llm_classify_deploy(
     # OTHER → requires_human → fix_instruction không được dùng
     fix = parsed.get("fix_instruction") if et in ("LOGIC", "MISSING_RESOURCE") else None
     return et, (str(fix)[:500] if fix else None)
+
+
+def _route_back_fix_feedback(error_type: str, root_cause: str, fix: str | None) -> dict:
+    """fix_feedback chuẩn khi A5 route ngược: LOGIC→A3 (engineering), MISSING→A1 (architecture).
+
+    validate_passed/plan_passed=True vì A4 đã pass — lỗi chỉ xảy ra ở apply-time.
+    Gộp 2 block LOGIC/MISSING vốn giống hệt nhau (chỉ khác error_type + root_cause).
+    """
+    return {
+        "overall_passed": False,
+        "error_type": error_type,
+        "root_cause": root_cause,
+        "fix_instruction": fix,
+        "checkov": {"passed_count": 0, "failed": []},
+        "validate_passed": True,
+        "plan_passed": True,
+    }
+
+
+def _routing_log_append(state: AgentState, error_type: str | None,
+                        root_cause: str | None, fix: str | None,
+                        predicted_route: str) -> list:
+    """Thêm 1 entry audit vào routing_log (đối xứng A4 — routing_log là audit chung).
+
+    Trước đây A5 KHÔNG ghi routing_log → audit trail mù toàn bộ vòng deploy.
+    `round` = total_val_attempts + total_deploy_attempts (round toàn cục đơn điệu xuyên 2 pha;
+    deploy fail bump total_deploy_attempts nên dùng tổng để round vẫn tăng đều ở pha deploy).
+    """
+    return state["routing_log"] + [{
+        "round": state["total_val_attempts"] + state["total_deploy_attempts"],
+        "error_type": error_type,
+        "root_cause": root_cause,
+        "fix_instruction": fix,
+        "predicted_route": predicted_route,
+    }]
 
 
 def _handle_failure(
@@ -276,8 +240,12 @@ def _handle_failure(
     if is_timeout:
         # apply bị SIGKILL sau _APPLY_TIMEOUT → terraform state có thể bị corrupt
         error_type = "INFRASTRUCTURE"
+    elif matches_any(error_text, _PERMISSION_PATTERNS):
+        # Quyền/credential thiếu → không fix bằng code, không retry apply → OTHER (human).
+        # Đặt TRƯỚC _INFRASTRUCTURE_PATTERNS để KHÔNG bị in-node retry phí 1 lần apply.
+        error_type = "OTHER"
     elif matches_any(error_text, _INFRASTRUCTURE_PATTERNS):
-        # Network/auth/quota → không phải code bug → không route A3
+        # Network/throttle/quota tạm thời → không phải code bug → in-node retry 1 lần
         error_type = "INFRASTRUCTURE"
     elif matches_any(error_text, MISSING_RESOURCE_PATTERNS):
         # Resource type không tồn tại/không hỗ trợ → A1 cần re-plan
@@ -327,12 +295,15 @@ def _handle_failure(
         failed_resource = _guess_failed_resource(error_text, resource_labels)
         error_type, fix = _llm_classify_deploy(
             error_text, resource_labels, failed_resource,
-            partial, partial_destroyed, state["retries"]["deploy"]["count"],
+            partial, partial_destroyed, state["retries"]["deploy_eng"]["count"],
         )
 
     # ── Step 5: Increment retry counter + build base result ──────────────────
-    if error_type not in ("LOGIC", "MISSING_RESOURCE"):
-        state["total_attempts"] += 1
+    # LOGIC/MISSING_RESOURCE bump total_deploy_attempts qua increment_retry ở Step 6 — TRỪ khi
+    # destroy_failed (Step 6 bị skip vì điều kiện `not destroy_failed`) → bump tại đây
+    # để total_deploy_attempts không đếm thiếu (giữ deploy-phase backstop + audit chính xác).
+    if error_type not in ("LOGIC", "MISSING_RESOURCE") or destroy_failed:
+        state["total_deploy_attempts"] += 1
 
     logger.info(
         "Agent 5: FAIL %s (partial=%s destroyed=%s destroy_failed=%s)",
@@ -340,7 +311,7 @@ def _handle_failure(
     )
 
     # Base result dict — LOGIC/MISSING sẽ thêm fix_feedback vào bên dưới.
-    # retries và total_attempts: trả về state hiện tại (đã mutate bởi increment_retry).
+    # retries và total_val_attempts: trả về state hiện tại (đã mutate bởi increment_retry).
     result: dict = {
         "deployment_result": _deploy_result(
             False, error_type,
@@ -352,7 +323,8 @@ def _handle_failure(
             apply_raw_error=error_text[:3000],
         ),
         "retries": state["retries"],
-        "total_attempts": state["total_attempts"],
+        "total_val_attempts": state["total_val_attempts"],
+        "total_deploy_attempts": state["total_deploy_attempts"],
     }
 
     # ── Step 6: Special handling cho actionable errors ───────────────────────
@@ -363,35 +335,35 @@ def _handle_failure(
     if error_type == "LOGIC" and not destroy_failed:
         increment_retry(state, "deploy_eng", "LOGIC_DEPLOY", error_text[:200])
         # fix_feedback với root_cause="engineering" → route_after_deployment → A3
-        result["fix_feedback"] = {
-            "overall_passed": False,
-            "error_type": "LOGIC",
-            "root_cause": "engineering",
-            "fix_instruction": fix,
-            "checkov": {"passed_count": 0, "failed": []},
-            # validate_passed/plan_passed=True vì A4 đã pass — lỗi xảy ra ở apply
-            "validate_passed": True,
-            "plan_passed": True,
-        }
-        # Cập nhật retries sau khi increment "deploy_eng" (total_attempts cũng tăng)
+        result["fix_feedback"] = _route_back_fix_feedback("LOGIC", "engineering", fix)
+        # Cập nhật retries sau khi increment "deploy_eng" (total_deploy_attempts cũng tăng)
         result["retries"] = state["retries"]
-        result["total_attempts"] = state["total_attempts"]
+        result["total_val_attempts"] = state["total_val_attempts"]
+        result["total_deploy_attempts"] = state["total_deploy_attempts"]
 
     # MISSING_RESOURCE: resource type không tồn tại → A1 cần re-plan.
     # Ví dụ: A1 plan dùng aws_lambda_event_source_mapping nhưng thiếu aws_sqs_queue.
     elif error_type == "MISSING_RESOURCE" and not destroy_failed:
         increment_retry(state, "deploy_arch", "MISSING_RESOURCE_DEPLOY", error_text[:200])
-        result["fix_feedback"] = {
-            "overall_passed": False,
-            "error_type": "MISSING_RESOURCE",
-            "root_cause": "architecture",
-            "fix_instruction": fix,
-            "checkov": {"passed_count": 0, "failed": []},
-            "validate_passed": True,
-            "plan_passed": True,
-        }
+        result["fix_feedback"] = _route_back_fix_feedback("MISSING_RESOURCE", "architecture", fix)
         result["retries"] = state["retries"]
-        result["total_attempts"] = state["total_attempts"]
+        result["total_val_attempts"] = state["total_val_attempts"]
+        result["total_deploy_attempts"] = state["total_deploy_attempts"]
+
+    # ── Audit: ghi routing_log (đối xứng A4) ─────────────────────────────────
+    # predicted_route phản ánh quyết định ở node (chưa tính budget — giống A4):
+    #   destroy_failed → human (dirty state) | LOGIC → A3 | MISSING → A1 | còn lại → human
+    if destroy_failed:
+        predicted_route = "requires_human"
+    else:
+        predicted_route = {
+            "LOGIC": "engineering",
+            "MISSING_RESOURCE": "architecture",
+        }.get(error_type, "requires_human")
+    result["routing_log"] = _routing_log_append(
+        state, error_type, result.get("fix_feedback", {}).get("root_cause"),
+        fix, predicted_route,
+    )
 
     return result
 
@@ -409,13 +381,19 @@ def deployment_node(state: AgentState) -> dict:
     Tại sao init lại sau A4 đã init?
       A4 và A5 dùng different working directories (terraform_workdir tạo temp dir riêng).
       Provider cache được share qua plugin cache → init lần 2 nhanh hơn (không download lại).
+      Nếu run_dir được set: A5 reuse thư mục A4 (reuse=True) → skip init hoàn toàn.
+
+    Chi phí in-node retry: khi apply INFRASTRUCTURE ở attempt=0, _handle_failure chạy
+      terraform destroy (cleanup partial state) trước khi retry. Với ElastiCache/RDS,
+      destroy mất 5–10 phút → tổng 1 in-node retry ~20 phút. Nếu resource chậm,
+      consider tăng _APPLY_TIMEOUT.
     """
     code = state["generated_code"]
 
     # Log retry count để trace: biết A5 đang ở lần retry thứ mấy
     logger.info(
-        "Agent 5: deploy_retry=%d eng_retry=%d",
-        state["retries"].get("deploy", {}).get("count", 0),
+        "Agent 5: deploy_arch_retry=%d deploy_eng_retry=%d",
+        state["retries"].get("deploy_arch", {}).get("count", 0),
         state["retries"].get("deploy_eng", {}).get("count", 0),
     )
 
@@ -423,47 +401,63 @@ def deployment_node(state: AgentState) -> dict:
     # files_dir: stub files (Lambda zip, S3 object content) cần copy vào working dir
     files_dir = (Path(run_dir) / "files") if run_dir else None
 
-    with terraform_workdir(run_dir or None, "a5") as d:
+    # reuse=True khi có run_dir: A5 tái sử dụng thư mục A4 đã init (không xóa .terraform/).
+    # reuse=False khi không có run_dir: tempdir mới, phải init từ đầu.
+    with terraform_workdir(run_dir or None, "a4", reuse=bool(run_dir)) as d:
         # Ghi HCL + stubs vào temp directory
         write_terraform_dir(d, code, files_dir=files_dir)
 
-        # ── terraform init + apply — retry 1 lần in-node nếu INFRASTRUCTURE ──
-        # Giống A4: transient issue (network/quota) tự hết sau 1 lần chờ → retry ngay.
-        # Không qua graph (tránh overhead routing + state cycle không cần thiết).
-        for attempt in range(2):
-            # ── terraform init ────────────────────────────────────────────────
-            logger.info("Agent 5: terraform init attempt=%d (timeout=%ds)", attempt, _INIT_TIMEOUT)
-            try:
-                init = run_terraform(["terraform", "init", "-no-color"], d, _INIT_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                if attempt == 0:
-                    logger.warning("Agent 5: init timeout — retry in-node")
-                    continue
-                logger.error("Agent 5: init timeout (sau retry)")
-                state["total_attempts"] += 1
-                return {
-                    "deployment_result": _deploy_result(
-                        False, "INFRASTRUCTURE",
-                        fix_instruction=f"terraform init timed out (>{_INIT_TIMEOUT}s)",
-                    ),
-                    "retries": state["retries"],
-                    "total_attempts": state["total_attempts"],
-                }
+        # Skip init nếu .terraform/ đã tồn tại (A4 đã init cùng thư mục).
+        # Tiết kiệm 10-30s download provider; chỉ khả dụng khi run_dir được set.
+        tf_initialized = (Path(d) / ".terraform").exists()
+        if tf_initialized:
+            logger.info("Agent 5: reusing A4 init — skip terraform init")
 
-            if init.returncode != 0:
-                if attempt == 0:
-                    logger.warning("Agent 5: init failed — retry in-node")
-                    continue
-                logger.error("Agent 5: init FAILED (sau retry)")
-                state["total_attempts"] += 1
-                return {
-                    "deployment_result": _deploy_result(
-                        False, "INFRASTRUCTURE",
-                        fix_instruction=f"terraform init failed: {init.stderr[:300]}",
-                    ),
-                    "retries": state["retries"],
-                    "total_attempts": state["total_attempts"],
-                }
+        # ── terraform init + apply — retry in-node nếu INFRASTRUCTURE ──
+        # Giống A4: transient issue (network/quota) tự hết sau 1 lần chờ → retry.
+        # Không qua graph (tránh overhead routing + state cycle không cần thiết).
+        for attempt in range(_MAX_APPLY_TRANSIENT_RETRY + 1):
+            if attempt > 0:
+                # Backoff trước khi retry in-node — tránh hammer API đang throttle
+                # (throttling/rate exceeded ∈ _INFRASTRUCTURE_PATTERNS). Đối xứng A4
+                # (_PLAN_RETRY_BACKOFF); trước đây A5 retry tức thì, thiếu nhịp chờ.
+                time.sleep(_APPLY_RETRY_BACKOFF * attempt)
+            # ── terraform init (chỉ khi chưa có .terraform/) ─────────────────
+            if not tf_initialized:
+                logger.info("Agent 5: terraform init attempt=%d (timeout=%ds)", attempt, _INIT_TIMEOUT)
+                try:
+                    init = run_terraform(tf_init_cmd(), d, _INIT_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    if attempt == 0:
+                        logger.warning("Agent 5: init timeout — retry in-node")
+                        continue
+                    logger.error("Agent 5: init timeout (sau retry)")
+                    state["total_deploy_attempts"] += 1
+                    return {
+                        "deployment_result": _deploy_result(
+                            False, "INFRASTRUCTURE",
+                            fix_instruction=f"terraform init timed out (>{_INIT_TIMEOUT}s)",
+                        ),
+                        "retries": state["retries"],
+                        "total_val_attempts": state["total_val_attempts"],
+                        "total_deploy_attempts": state["total_deploy_attempts"],
+                    }
+
+                if init.returncode != 0:
+                    if attempt == 0:
+                        logger.warning("Agent 5: init failed — retry in-node")
+                        continue
+                    logger.error("Agent 5: init FAILED (sau retry)")
+                    state["total_deploy_attempts"] += 1
+                    return {
+                        "deployment_result": _deploy_result(
+                            False, "INFRASTRUCTURE",
+                            fix_instruction=f"terraform init failed: {init.stderr[:300]}",
+                        ),
+                        "retries": state["retries"],
+                        "total_val_attempts": state["total_val_attempts"],
+                        "total_deploy_attempts": state["total_deploy_attempts"],
+                    }
 
             # ── terraform apply ───────────────────────────────────────────────
             logger.info("Agent 5: terraform apply attempt=%d (timeout=%ds)", attempt, _APPLY_TIMEOUT)
@@ -472,15 +466,23 @@ def deployment_node(state: AgentState) -> dict:
                     ["terraform", "apply", "-auto-approve", "-no-color"], d, _APPLY_TIMEOUT
                 )
             except subprocess.TimeoutExpired:
+                _attempts_before = state["total_deploy_attempts"]
                 failure = _handle_failure(state, d, "", "terraform apply timed out", is_timeout=True)
                 if attempt == 0 and failure["deployment_result"]["error_type"] == "INFRASTRUCTURE":
+                    # In-node retry trong suốt với graph budget (đối xứng A4 plan-transient):
+                    # hoàn lại total_deploy_attempts mà _handle_failure đã bump cho attempt sắp retry.
+                    state["total_deploy_attempts"] = _attempts_before
                     logger.warning("Agent 5: apply timeout — retry in-node")
                     continue
                 return failure
 
             if apply.returncode != 0:
+                _attempts_before = state["total_deploy_attempts"]
                 failure = _handle_failure(state, d, apply.stdout or "", apply.stderr or "", is_timeout=False)
                 if attempt == 0 and failure["deployment_result"]["error_type"] == "INFRASTRUCTURE":
+                    # In-node retry trong suốt với graph budget (đối xứng A4 plan-transient):
+                    # hoàn lại total_deploy_attempts mà _handle_failure đã bump cho attempt sắp retry.
+                    state["total_deploy_attempts"] = _attempts_before
                     logger.warning("Agent 5: apply INFRASTRUCTURE — retry in-node")
                     continue
                 return failure
@@ -544,13 +546,14 @@ def deployment_node(state: AgentState) -> dict:
 def route_after_deployment(state: AgentState) -> str:
     """Conditional edge sau A5 — quyết định node tiếp theo.
 
-    Thứ tự kiểm tra:
+    Thứ tự kiểm tra (ĐỐI XỨNG với route_after_validation):
       1. Success → end (done)
       2. destroy_failed → requires_human (dirty state, LUÔN cần human)
-      3. INFRASTRUCTURE → requires_human (đã retry in-node rồi)
-      4. LOGIC → route A3 nếu còn budget (code bug, A3 fix)
-      5. MISSING_RESOURCE → route A1 nếu còn budget (resource type sai, A1 re-plan)
-      6. Mọi trường hợp còn lại (OTHER, PERMISSION, QUOTA, exhausted) → requires_human
+      3. total_deploy_attempts >= MAX_DEPLOY_TOTAL_RETRY → requires_human (deploy-phase backstop, ĐỘC LẬP A4)
+      4. INFRASTRUCTURE → requires_human (đã retry in-node rồi)
+      5. LOGIC → route A3 nếu còn budget (code bug, A3 fix)
+      6. MISSING_RESOURCE → route A1 nếu còn budget (resource type sai, A1 re-plan)
+      7. Mọi trường hợp còn lại (OTHER, PERMISSION, QUOTA, exhausted) → requires_human
     """
     dr = state["deployment_result"]
 
@@ -560,7 +563,19 @@ def route_after_deployment(state: AgentState) -> str:
 
     # Dirty state: resources tồn tại trên AWS nhưng không thể destroy.
     # Không retry bất kỳ gì — người phải cleanup thủ công trước khi chạy lại.
+    # Đặt TRƯỚC global cap vì đây là vấn đề an toàn (dirty state) chứ không phải budget.
     if dr.get("destroy_failed"):
+        return "requires_human"
+
+    # Deploy-phase backstop — ĐỘC LẬP với total_val_attempts của validation phase.
+    # total_deploy_attempts chỉ tăng bởi fail của A5 (increment_retry deploy_* + các nhánh
+    # infra/timeout trong node). Tách khỏi total_val_attempts để A4 đốt hết budget của nó
+    # KHÔNG starve A5: lỗi apply-time là lớp mới, A5 phải có lượt sửa riêng.
+    # Per-counter deploy_eng/deploy_arch (≤2) vẫn là sub-limit của riêng lớp deploy;
+    # backstop này chống explosion khi re-plan reset các per-agent counter.
+    if state["total_deploy_attempts"] >= MAX_DEPLOY_TOTAL_RETRY:
+        logger.info("Agent 5: max deploy attempts (%d >= %d) — requires_human",
+                    state["total_deploy_attempts"], MAX_DEPLOY_TOTAL_RETRY)
         return "requires_human"
 
     error_type = dr["error_type"]

@@ -6,7 +6,7 @@ class RetryTracker(TypedDict):
     count: int              # số lần đã retry
     last_error_type: str    # loại lỗi cuối (debug)
     last_error_details: str # mô tả lỗi cuối (debug)
-    error_history: list     # list[str] — 5 lỗi gần nhất, dùng cho oscillation detection
+    error_history: list     # list[str] — 5 error_type gần nhất, bơm vào prompt LLM (tránh lặp lỗi cũ) + debug
 
 
 class AgentState(TypedDict):
@@ -37,6 +37,11 @@ class AgentState(TypedDict):
     # checks=[] nghĩa là A2 không chọn check nào cho resource đó (intent hoặc lỗi)
     security_profile: dict
 
+    # A2 status: "ok" (A2 chạy xong, kể cả khi chủ động chọn 0 check) vs
+    # "degraded" (LLM hỏng → profile rỗng KHÔNG do intent). Tách 2 trạng thái này
+    # để A4 không PASS security gate thầm và eval/score đếm được run bị degrade.
+    security_status: str
+
     # A3: HCL Terraform hoàn chỉnh (terraform{} + provider{} + resource{} blocks)
     generated_code: str
 
@@ -63,7 +68,8 @@ class AgentState(TypedDict):
     # deploy_arch: A5 → A1 (MISSING_RESOURCE_DEPLOY),  cap = MAX_DEPLOY_ARCH_RETRY
     # sec:         security gate A4, hết → best-effort deploy (không block)
     retries: dict[str, RetryTracker]
-    total_attempts: int  # global backstop — max MAX_TOTAL_RETRY=5, tăng mỗi lần fail bất kỳ
+    total_val_attempts: int    # validation-phase backstop — max MAX_TOTAL_RETRY=5, tăng mỗi fail của A1/A3/A4
+    total_deploy_attempts: int   # deploy-phase backstop — max MAX_DEPLOY_TOTAL_RETRY=4, chỉ A5 fail tăng (độc lập total_val_attempts)
 
     # ── Oscillation prevention ─────────────────────────────────────────────────
     # Lưu 2 fix_instruction gần nhất gửi tới A1/A3 — đút vào prompt để agent
