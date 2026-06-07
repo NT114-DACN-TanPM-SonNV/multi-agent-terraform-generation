@@ -366,6 +366,11 @@ def run_row_lg(
     state: dict = build_initial_state(prompt)
     state["run_dir"] = str(run_dir)
 
+    # Per-worker terraform plugin cache (tránh contention với 5+ workers)
+    plugin_cache_dir = run_dir / ".terraform" / "plugins"
+    plugin_cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TF_PLUGIN_CACHE_DIR"] = str(plugin_cache_dir)
+
     # Accumulate stream updates
     timings: dict[str, float] = {}       # node → cumulative elapsed (giây)
     node_counts: dict[str, int] = {}     # node → số lần chạy
