@@ -18,12 +18,21 @@ import time
 from pathlib import Path
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger("cleanup")
+
+_BOTO_CONFIG = Config(
+    retries={"max_attempts": 10, "mode": "adaptive"},
+    connect_timeout=10,
+    read_timeout=60,
+    max_pool_connections=50,
+    proxies={},
+)
 
 # ── HCL parser ──────────────────────────────────────────────────────────────
 
@@ -215,7 +224,7 @@ def del_iam_policy(name: str, iam, dry: bool):
     log.info("IAM policy: %s", name)
     if dry:
         return
-    acct = boto3.client("sts").get_caller_identity()["Account"]
+    acct = boto3.client("sts", config=_BOTO_CONFIG).get_caller_identity()["Account"]
     arn = f"arn:aws:iam::{acct}:policy/{name}"
     try:
         for pg in iam.get_paginator("list_entities_for_policy").paginate(PolicyArn=arn):
@@ -606,25 +615,25 @@ def sweep(resources: list[tuple[str, str, str | None]], region: str, dry: bool):
     session = boto3.Session(region_name=region)
 
     clients = {
-        "s3":       session.client("s3"),
-        "lam":      session.client("lambda"),
-        "iam":      session.client("iam"),
-        "cb":       session.client("codebuild"),
-        "fh":       session.client("firehose"),
-        "logs":     session.client("logs"),
-        "cw":       session.client("cloudwatch"),
-        "events":   session.client("events"),
-        "ssm":      session.client("ssm"),
-        "sm":       session.client("secretsmanager"),
-        "kms":      session.client("kms"),
-        "sns":      session.client("sns"),
-        "sqs":      session.client("sqs"),
-        "ddb":      session.client("dynamodb"),
-        "apigw":    session.client("apigateway"),
-        "efs":      session.client("efs"),
-        "backup":   session.client("backup"),
-        "r53":      session.client("route53"),
-        "ec2":      session.client("ec2"),
+        "s3":       session.client("s3", config=_BOTO_CONFIG),
+        "lam":      session.client("lambda", config=_BOTO_CONFIG),
+        "iam":      session.client("iam", config=_BOTO_CONFIG),
+        "cb":       session.client("codebuild", config=_BOTO_CONFIG),
+        "fh":       session.client("firehose", config=_BOTO_CONFIG),
+        "logs":     session.client("logs", config=_BOTO_CONFIG),
+        "cw":       session.client("cloudwatch", config=_BOTO_CONFIG),
+        "events":   session.client("events", config=_BOTO_CONFIG),
+        "ssm":      session.client("ssm", config=_BOTO_CONFIG),
+        "sm":       session.client("secretsmanager", config=_BOTO_CONFIG),
+        "kms":      session.client("kms", config=_BOTO_CONFIG),
+        "sns":      session.client("sns", config=_BOTO_CONFIG),
+        "sqs":      session.client("sqs", config=_BOTO_CONFIG),
+        "ddb":      session.client("dynamodb", config=_BOTO_CONFIG),
+        "apigw":    session.client("apigateway", config=_BOTO_CONFIG),
+        "efs":      session.client("efs", config=_BOTO_CONFIG),
+        "backup":   session.client("backup", config=_BOTO_CONFIG),
+        "r53":      session.client("route53", config=_BOTO_CONFIG),
+        "ec2":      session.client("ec2", config=_BOTO_CONFIG),
     }
 
     # Phân loại theo type
@@ -743,7 +752,7 @@ def cleanup_row(
 ) -> None:
     """Xóa AWS resources của 1 row ngay sau khi pipeline hoàn tất.
 
-    Thiết kế: chạy SAU auto_destroy của A5, đóng vai trò safety net. Idempotent —
+    Thiết kế: chạy SAU destroy của A5, đóng vai trò safety net. Idempotent —
     resource đã xóa sẽ trả NotFound và bị bỏ qua. Nuốt mọi exception để không
     làm fail row result.
     """

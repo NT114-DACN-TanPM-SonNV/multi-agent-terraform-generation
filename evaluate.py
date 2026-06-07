@@ -8,7 +8,6 @@ Chạy:
     python evaluate.py --csv dataset/data-dev.csv --limit 5
     python evaluate.py --csv dataset/data-test.csv --cases 0 3 7-10
     python evaluate.py --no-deploy --csv dataset/data-test.csv
-    python evaluate.py --no-destroy --csv dataset/data-test.csv
     python evaluate.py --workers 3 --csv dataset/data-test.csv
 """
 import argparse
@@ -23,7 +22,6 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import re
-import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -53,6 +51,7 @@ from graph import (
     route_after_engineering,
     RECURSION_LIMIT,
 )
+from core.terraform import _safe_rmtree
 from cleanup import cleanup_row as _cleanup_row
 from agents.architecture import architecture_node
 from agents.security import security_node
@@ -169,6 +168,45 @@ def _resource_comparison(gt_types: list[str], created: list[str]) -> dict:
 _DECLARED_RE = re.compile(r'(?:resource|data)\s+"([^"]+)"\s+"[^"]+"')
 
 
+def _check_aws_identity() -> None:
+    """Fail fast when Terraform would be unable to validate AWS credentials.
+
+    botocore retry (max_attempts=3) chỉ ride qua blip cỡ vài giây. Một sự cố
+    DNS/network ngắn (10-30s) đúng khoảnh khắc preflight sẽ giết cả batch 34 row.
+    Vòng retry NGOÀI với backoff dài (mặc định 3 lần × ~10s) cho phép batch sống
+    sót qua blip lúc khởi động. Override qua AWS_PREFLIGHT_RETRIES.
+    """
+    import boto3
+    from botocore.config import Config
+    attempts = int(os.environ.get("AWS_PREFLIGHT_RETRIES", "3"))
+    cfg = Config(
+        connect_timeout=10,
+        read_timeout=30,
+        retries={"max_attempts": 3, "mode": "standard"},
+        proxies={},
+    )
+    last_err: Exception | None = None
+    for i in range(attempts):
+        try:
+            ident = boto3.client("sts", config=cfg).get_caller_identity()
+            acct = ident.get("Account", "")
+            arn = ident.get("Arn", "")
+            print(f"AWS identity OK  |  account={acct}  |  arn={arn}")
+            return
+        except Exception as e:
+            last_err = e
+            if i < attempts - 1:
+                wait = 5 * (i + 1)  # 5s, 10s, ... ride qua blip DNS/network
+                print(f"AWS preflight attempt {i+1}/{attempts} failed "
+                      f"({type(e).__name__}) — retry sau {wait}s", file=sys.stderr)
+                time.sleep(wait)
+    raise RuntimeError(
+        "AWS credential preflight failed sau "
+        f"{attempts} lần. Terraform plan/apply cũng sẽ fail: "
+        f"{type(last_err).__name__}: {last_err}"
+    ) from last_err
+
+
 def _declared_types(code: str) -> list[str]:
     """Type của MỌI block khai báo trong HCL (cả resource lẫn data source).
 
@@ -220,12 +258,16 @@ def _extract_results(
         if not ok:
             fb = final_state.get("fix_feedback") or {}
             archi_result["error"] = fb.get("fix_instruction", "unknown")
+            archi_result["error_label"] = fb.get("error_label")
+            archi_result["error_stage"] = fb.get("error_stage")
 
     # secu
     secu_result = None
     if "security" in timings:
+        sec_status = final_state.get("security_status", "ok")
         secu_result = {
             "ok": True,
+            "status": sec_status,
             "elapsed_s": timings["security"],
             "security_profile": final_state.get("security_profile") or {},
         }
@@ -245,6 +287,8 @@ def _extract_results(
         if not ok:
             fb = final_state.get("fix_feedback") or {}
             engi_result["error"] = fb.get("fix_instruction", "unknown")
+            engi_result["error_label"] = fb.get("error_label")
+            engi_result["error_stage"] = fb.get("error_stage")
 
     # val — dùng val_feedback (captured lúc validation chạy) để tránh bị A5 ghi đè fix_feedback.
     val_result = None
@@ -260,10 +304,10 @@ def _extract_results(
             "checkov_failed_ids": ck.get("failed_ckv_ids", []),
             "validate_ok": fb.get("validate_passed"),
             "plan_ok": fb.get("plan_passed"),
-            "security_incomplete": bool(fb.get("unmet_checks")),
+            "security_incomplete": bool(fb.get("applicable_failed_checks")),
             "security_degraded": bool(fb.get("security_degraded")),
-            "unmet_checks": fb.get("unmet_checks", []),
-            "phantom_checks": fb.get("phantom_checks", []),
+            "applicable_failed_checks": fb.get("applicable_failed_checks", []),
+            "not_applicable_checks": fb.get("not_applicable_checks", []),
             "raw_error": (fb.get("raw_error") or "")[:2000],
             "fix_instruction": (fb.get("fix_instruction") or "")[:500],
             "attempts": node_counts.get("validation", 0),
@@ -278,9 +322,11 @@ def _extract_results(
             "ok": ok,
             "elapsed_s": timings["deployment"],
             "error_type": dr.get("error_type") if not ok else None,
+            "error_label": dr.get("error_label") if not ok else None,
+            "cleanup_error_label": dr.get("cleanup_error_label") if not ok else None,
             "resources_created": dr.get("resources_created", []),
-            "auto_destroyed": dr.get("auto_destroyed", False),
-            "auto_destroy_error": dr.get("auto_destroy_error"),
+            "destroyed": dr.get("destroyed", False),
+            "destroy_error": dr.get("destroy_error"),
             "apply_raw_error": (dr.get("apply_raw_error") or "")[:2000],
             "fix_instruction": (dr.get("fix_instruction") or "")[:500],
             "attempts": node_counts.get("deployment", 0),
@@ -296,7 +342,6 @@ def run_row_lg(
     difficulty: str,
     prompt: str,
     g,
-    auto_destroy: bool,
     no_deploy: bool,
     gt_types: list[str] | None = None,
     live: bool = False,
@@ -318,7 +363,7 @@ def run_row_lg(
     # Build initial state — patch run_dir (build_initial_state không có field này)
     run_dir = ROOT / "tmp" / f"row_{idx}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state: dict = build_initial_state(prompt, auto_destroy=auto_destroy)
+    state: dict = build_initial_state(prompt)
     state["run_dir"] = str(run_dir)
 
     # Accumulate stream updates
@@ -356,13 +401,17 @@ def run_row_lg(
                         log(f"  [archi] {n} resources ({elapsed}s)")
                     else:
                         fb = update.get("fix_feedback") or {}
+                        label = fb.get("error_label")
+                        label_s = f" [{label}]" if label else ""
                         log(f"  [archi] FAILED ({elapsed}s): "
-                            f"{(fb.get('fix_instruction') or '')[:200]}")
+                            f"{(fb.get('fix_instruction') or '')[:200]}{label_s}")
 
                 elif node_name == "security":
                     prof = update.get("security_profile") or {}
                     checks_summary = {k: v.get("checks", []) for k, v in prof.items() if v.get("checks")}
-                    log(f"  [secu]  {len(prof)} resources ({elapsed}s)")
+                    sec_status = update.get("security_status", "ok")
+                    status_s = f" status={sec_status}" if sec_status != "ok" else ""
+                    log(f"  [secu]  {len(prof)} resources ({elapsed}s){status_s}")
                     if checks_summary:
                         log(f"    security checks: {checks_summary}")
 
@@ -374,8 +423,10 @@ def run_row_lg(
                             f"{code.count(chr(10))} lines ({elapsed}s)")
                     else:
                         fb = update.get("fix_feedback") or {}
+                        label = fb.get("error_label")
+                        label_s = f" [{label}]" if label else ""
                         log(f"  [engi]  FAILED ({elapsed}s): "
-                            f"{(fb.get('fix_instruction') or '')[:80]}")
+                            f"{(fb.get('fix_instruction') or '')[:80]}{label_s}")
 
                 elif node_name == "validation":
                     fb = update.get("fix_feedback") or {}
@@ -383,16 +434,18 @@ def run_row_lg(
                     passed = bool(fb.get("overall_passed"))
                     et = fb.get("error_type", "")
                     ck = fb.get("checkov") or {}
-                    unmet = fb.get("unmet_checks") or []
+                    applicable_failed = fb.get("applicable_failed_checks") or []
                     status = "PASS" if passed else f"FAIL [{et}]"
-                    if passed and unmet:
-                        unmet_ids = sorted({u.get("ckv_id") for u in unmet})
-                        status = f"PASS (security best-effort, unmet {unmet_ids})"
-                    phantom = fb.get("phantom_checks") or []
+                    if passed and applicable_failed:
+                        failed_ids = sorted({u.get("ckv_id") for u in applicable_failed})
+                        status = f"PASS (security best-effort, applicable failed {failed_ids})"
+                    not_applicable = fb.get("not_applicable_checks") or []
+                    if fb.get("security_degraded"):
+                        status += " [degraded]"
                     ck_str = (f"ckv pass={ck.get('passed_count',0)} "
                               f"fail={ck.get('failed_count',0)} "
                               f"fail_ids={ck.get('failed_ckv_ids',[])}"
-                              + (f" phantom={phantom}" if phantom else "")) if ck else ""
+                              + (f" not_applicable={not_applicable}" if not_applicable else "")) if ck else ""
                     attempt = node_counts.get("validation", 0)
                     total_r = final_state.get("total_val_attempts", 0)
                     log(f"  [val]   {status} ({elapsed}s) {ck_str}"
@@ -406,11 +459,15 @@ def run_row_lg(
                     attempt = node_counts.get("deployment", 0)
                     if ok:
                         n_created = len(dr.get("resources_created", []))
-                        d_str = "(destroyed)" if dr.get("auto_destroyed") else "(resources kept)"
+                        d_str = "(destroyed)" if dr.get("destroyed") else "(resources kept)"
                         log(f"  [deploy] OK ({elapsed}s) {n_created} resources {d_str}")
                     else:
                         et = dr.get("error_type", "")
-                        log(f"  [deploy] FAIL [{et}] ({elapsed}s) attempt={attempt}")
+                        label = dr.get("error_label")
+                        cleanup_label = dr.get("cleanup_error_label")
+                        label_s = f" label={label}" if label else ""
+                        cleanup_s = f" cleanup={cleanup_label}" if cleanup_label else ""
+                        log(f"  [deploy] FAIL [{et}] ({elapsed}s) attempt={attempt}{label_s}{cleanup_s}")
                         if dr.get("fix_instruction"):
                             log(f"  [deploy] fix: {dr['fix_instruction'][:100]}")
 
@@ -426,7 +483,7 @@ def run_row_lg(
         log(traceback.format_exc())
         _stream_error = str(e)
 
-    # Post-row AWS cleanup — safety net sau auto_destroy A5.
+    # Post-row AWS cleanup — safety net sau destroy của A5.
     # Chỉ chạy khi có deploy thật (no_deploy=False); idempotent (NotFound bị bỏ qua).
     if not no_deploy:
         _cleanup_row(
@@ -435,9 +492,10 @@ def run_row_lg(
             row_idx=idx,
         )
 
-    # Cleanup per-run dir
+    # Cleanup per-run dir — _safe_rmtree (rmdir /s /q trên Windows) KHÔNG follow
+    # directory junction trong .terraform/providers/ → không xóa nhầm plugin cache.
     if run_dir.exists():
-        shutil.rmtree(run_dir, ignore_errors=True)
+        _safe_rmtree(run_dir)
 
     # graph.stream crash → trả sentinel ngay (cleanup đã xong, kết quả partial không tin được)
     if _stream_error:
@@ -525,7 +583,6 @@ def main():
     parser.add_argument("--cases",    nargs="+", default=None,
                         help="Row indices, e.g. --cases 0 3 7-10 15")
     parser.add_argument("--no-deploy",  action="store_true", help="Dừng sau A4")
-    parser.add_argument("--no-destroy", action="store_true", help="Giữ resources sau apply")
     parser.add_argument("--workers",  type=int, default=1,
                         help="Số worker song song (mặc định 1)")
     parser.add_argument("--row-timeout", type=int, default=1800,
@@ -536,6 +593,7 @@ def main():
     # Fail-fast: thiếu terraform/checkov thì báo ngay thay vì crash giữa batch.
     from core.terraform import check_required_tools
     check_required_tools()
+    _check_aws_identity()
 
     # Cảnh báo config mâu thuẫn: 1 call LLM (<= LLM_TIMEOUT) không được dài hơn ngân sách
     # cả row, nếu không case khó sẽ bị cắt giữa chừng = "timeout giả".
@@ -551,8 +609,7 @@ def main():
     provider = os.getenv("LLM_PROVIDER", "deepseek").lower()
     model = (os.getenv("DEEPSEEK_MODEL", "deepseek-chat") if provider == "deepseek"
              else os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct"))
-    deploy_str = ("no-deploy" if args.no_deploy
-                  else ("no-destroy" if args.no_destroy else "auto-destroy"))
+    deploy_str = "no-deploy" if args.no_deploy else "auto-destroy"
     print(f"Full pipeline A1→A2→A3→A4→A5 [LangGraph]  |  model={model}  "
           f"|  csv={CSV_PATH.name}  |  deploy={deploy_str}  |  workers={args.workers}")
 
@@ -574,7 +631,6 @@ def main():
         idx, difficulty, prompt, gt_types = row_args
         return run_row_lg(
             idx, difficulty, prompt, g,
-            auto_destroy=not args.no_destroy,
             no_deploy=args.no_deploy,
             gt_types=gt_types,
             live=live,

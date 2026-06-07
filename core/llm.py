@@ -9,14 +9,26 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 load_dotenv()
 
+if os.environ.get("LLM_USE_PROXY", "").lower() not in ("1", "true", "yes"):
+    for _proxy_key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        os.environ.pop(_proxy_key, None)
+
 _TIMEOUT     = int(os.environ.get("LLM_TIMEOUT",      "120"))
-_RETRIES     = int(os.environ.get("LLM_RETRIES",      "3"))
+_RETRIES     = int(os.environ.get("LLM_RETRIES",      "5"))
 _MAX_TOKENS  = int(os.environ.get("LLM_MAX_TOKENS",   "4096"))
 _TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE","0"))
+
+# Per-agent timeout override. If unset, agents inherit LLM_TIMEOUT.
+_TIMEOUT_PER_AGENT: dict[str, int] = {
+    "architecture": int(os.environ.get("LLM_TIMEOUT_ARCHI", str(_TIMEOUT))),
+}
 
 # Per-agent max_tokens — override LLM_MAX_TOKENS cho từng agent
 MAX_TOKENS_PER_AGENT = {
@@ -45,6 +57,11 @@ def _make_llm(max_tokens: int) -> BaseChatModel:
             temperature=_TEMPERATURE,
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com/v1",
+            # request timeout rõ ràng: một request treo tự fail (retryable) thay vì
+            # để ThreadPoolExecutor cắt cứng ở _TIMEOUT. max_retries=0 để tenacity
+            # (call_llm) là tầng retry DUY NHẤT — tránh backoff lồng nhau khó đoán.
+            timeout=_TIMEOUT,
+            max_retries=0,
         )
     else:
         from langchain_nvidia_ai_endpoints import ChatNVIDIA
@@ -65,32 +82,46 @@ _executor = ThreadPoolExecutor(max_workers=12)
 atexit.register(_executor.shutdown, wait=False)
 
 
-def _call_llm_with_model(model: BaseChatModel, messages: list) -> str:
+def _call_llm_with_model(model: BaseChatModel, messages: list, timeout: int = _TIMEOUT) -> str:
     future = _executor.submit(model.invoke, messages)
     try:
-        return future.result(timeout=_TIMEOUT).content
+        return future.result(timeout=timeout).content
     except FuturesTimeoutError:
-        raise TimeoutError(f"LLM call timed out after {_TIMEOUT}s")
+        raise TimeoutError(f"LLM call timed out after {timeout}s")
 
 
 _RAW_DEBUG = os.environ.get("LLM_RAW", "").lower() in ("1", "true")
 
 
+# wait_random_exponential: backoff có jitter để 3 worker song song không cùng retry
+# một nhịp (thundering herd) khi deepseek chập chờn. 5 attempt × max 30s → cửa sổ
+# retry ~60-90s, đủ ride qua blip API 10-20s (cấu hình cũ 3×max10 chỉ ~6s).
 @retry(
     stop=stop_after_attempt(_RETRIES),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    wait=wait_random_exponential(multiplier=1, max=30),
     reraise=True,
 )
 def call_llm(messages: list, agent: str | None = None) -> str:
     """Gọi LLM với timeout cứng và tự động retry.
 
     agent: tên agent ("architecture", "security", "engineering", "validation", "deployment")
-           — dùng để chọn max_tokens phù hợp. None → dùng LLM_MAX_TOKENS mặc định.
+           — dùng để chọn max_tokens và timeout phù hợp. None → dùng default.
 
     Set LLM_RAW=1 để print raw response ra stdout (debug).
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     model = _llm_registry.get(agent, llm) if agent else llm
-    raw = _call_llm_with_model(model, messages)
+    timeout = _TIMEOUT_PER_AGENT.get(agent, _TIMEOUT) if agent else _TIMEOUT
+
+    try:
+        raw = _call_llm_with_model(model, messages, timeout=timeout)
+    except Exception as e:
+        # Capture detailed error info for debugging
+        logger.debug(f"LLM call error ({agent}): {type(e).__name__}: {str(e)[:200]}")
+        raise
+
     if _RAW_DEBUG:
         print(f"\n{'─'*60}\n[LLM RAW — {agent or 'default'}]\n{raw}\n{'─'*60}\n")
     return raw

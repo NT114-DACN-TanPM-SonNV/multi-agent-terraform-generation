@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from contextlib import contextmanager
@@ -22,13 +23,29 @@ from pathlib import Path
 _TF_CACHE_DIR = Path(__file__).parent.parent / ".tf_plugin_cache"
 _TF_CACHE_DIR.mkdir(exist_ok=True)
 
+# Serialize concurrent terraform init calls — trên Windows, nhiều process cùng truy cập
+# plugin cache dir gây file lock error ("The process cannot access the file because it is
+# being used by another process"). init chạy rất nhanh so với LLM call nên lock không
+# ảnh hưởng throughput đáng kể khi chạy --workers > 1.
+_TF_INIT_LOCK = threading.Lock()
+
 # Env dùng chung cho mọi subprocess terraform.
-# TF_PLUGIN_CACHE_DIR bị bỏ — dùng -plugin-dir trong tf_init_cmd() thay thế.
-# TF_PLUGIN_CACHE_DIR khiến Terraform tạo directory junction từ working dir
-# vào cache; trên Windows junction cũ bị giữ handle → sequential runs fail
-# với "failed to remove existing ...cache..." ngay cả sau khi cleanup .terraform.
-# -plugin-dir: Terraform đọc provider trực tiếp, không tạo junction → không conflict.
+# Dùng -plugin-dir (offline) cache mode: provider từ cache sẵn → link, nhanh, không network.
 _TF_ENV = {**os.environ}
+for _proxy_key in (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+):
+    _TF_ENV.pop(_proxy_key, None)
+_TF_ENV["NO_PROXY"] = ",".join(
+    p for p in (
+        _TF_ENV.get("NO_PROXY", ""),
+        "amazonaws.com",
+        ".amazonaws.com",
+        "169.254.169.254",
+    )
+    if p
+)
 
 # Công cụ bắt buộc cho PIPELINE (generate→validate→deploy). `opa` KHÔNG ở đây vì
 # pipeline không dùng OPA — nó chỉ cần cho semantic eval (core/rego_eval.py),
@@ -36,36 +53,58 @@ _TF_ENV = {**os.environ}
 _REQUIRED_TOOLS = ("checkov", "terraform")
 
 
-def _sanitize_cache() -> None:
-    """Xóa thư mục cache rỗng do shutil.rmtree follow junction để lại.
+def _safe_rmtree(path: str | Path) -> None:
+    """Xóa cây thư mục an toàn với directory junction trên Windows.
 
     Python 3.11 Windows: shutil.rmtree FOLLOW directory junction và xóa nội dung
-    của TARGET (cache). Cache dir còn đó nhưng rỗng → Terraform không remove được
-    dir rỗng đó khi cần reinstall → 'failed to remove existing' error.
-
-    Fix: walk bottom-up, rmdir các dir rỗng → Terraform thấy provider không có
-    trong cache → download lại bình thường.
+    của TARGET. .terraform/providers/ chứa junction trỏ vào plugin cache, nên
+    shutil.rmtree(run_dir) sẽ xóa luôn nội dung cache → "failed to remove existing
+    ...cache..." ở init sau. `cmd /c rmdir /s /q` xóa junction entry mà KHÔNG
+    follow target → cache an toàn. Đây là cách dọn dùng chung cho cả .terraform/
+    (terraform_workdir._clean) lẫn run_dir (evaluate.py).
     """
-    if not _TF_CACHE_DIR.exists():
+    p = Path(path)
+    if not p.exists():
         return
-    for p in sorted(_TF_CACHE_DIR.rglob("*"), reverse=True):
-        if p.is_dir() and not any(p.iterdir()):
-            try:
-                p.rmdir()
-            except OSError:
-                pass
+    if sys.platform == "win32":
+        subprocess.run(
+            ["cmd", "/c", "rmdir", "/s", "/q", str(p)],
+            capture_output=True, timeout=30,
+        )
+    else:
+        shutil.rmtree(p, ignore_errors=True)
+
+
+# Provider mà 1 đoạn HCL cần = prefix trước dấu "_" đầu tiên của resource/data type
+# (aws_s3_bucket → aws, random_password → random, archive_file → archive). Đúng cho
+# mọi provider dùng trong benchmark; bắt cả `data` vì data source cũng cần provider.
+_DECL_TYPE_RE = re.compile(r'(?:resource|data)\s+"([^"]+)"')
+
+
+def required_provider_names(code: str) -> set[str]:
+    """Tập tên provider mà HCL cần (suy từ prefix của resource/data type)."""
+    return {m.group(1).split("_", 1)[0] for m in _DECL_TYPE_RE.finditer(code)}
+
+
+def installed_provider_names(dot_tf: Path) -> set[str]:
+    """Tập provider đã cài trong .terraform/providers/ — đọc filesystem, KHÔNG network.
+
+    Layout: providers/<host>/<namespace>/<name>/<version>/<os_arch>; lấy <name>.
+    Dùng để phát hiện A3 thêm provider mới giữa row (provider set đổi → cần re-init).
+    """
+    prov = dot_tf / "providers"
+    if not prov.exists():
+        return set()
+    return {p.name for p in prov.glob("*/*/*") if p.is_dir()}
 
 
 def tf_init_cmd() -> list[str]:
-    """terraform init command.
+    """terraform init command — dùng cache local exclusively.
 
-    Sanitize cache trước, rồi dùng -plugin-dir nếu cache có provider binary thật.
-    Fallback plain init khi cache rỗng (lần đầu hoặc sau khi sanitize xóa hết).
+    Provider phải có sẵn trong cache tại D:\2-6\.tf_plugin_cache.
+    Không download từ internet → offline, an toàn, nhanh.
     """
-    _sanitize_cache()
-    if any(_TF_CACHE_DIR.rglob("terraform-provider-*")):
-        return ["terraform", "init", "-plugin-dir", str(_TF_CACHE_DIR), "-no-color"]
-    return ["terraform", "init", "-no-color"]
+    return ["terraform", "init", "-plugin-dir", str(_TF_CACHE_DIR), "-no-color"]
 
 
 def check_required_tools() -> None:
@@ -295,22 +334,11 @@ def terraform_workdir(run_dir: str | Path | None, subdir: str, reuse: bool = Fal
 
     def _clean(p: Path) -> None:
         lock = p / ".terraform.lock.hcl"
-        dot_tf = p / ".terraform"
         if lock.exists():
             lock.unlink()
-        if dot_tf.exists():
-            if sys.platform == "win32":
-                # shutil.rmtree silent-fails trên Windows khi .terraform/providers/
-                # chứa directory junction trỏ vào plugin cache — junction entry không
-                # bị xóa, terraform init lần sau cố remove từ cache trước khi relink
-                # → "failed to remove existing ...cache..." error.
-                # rmdir /s /q xóa junction entry đúng cách mà không follow target.
-                subprocess.run(
-                    ["cmd", "/c", "rmdir", "/s", "/q", str(dot_tf)],
-                    capture_output=True, timeout=15,
-                )
-            else:
-                shutil.rmtree(dot_tf, ignore_errors=True)
+        # _safe_rmtree dùng rmdir /s /q trên Windows: xóa junction entry trong
+        # .terraform/providers/ mà không follow target (plugin cache) → init fresh.
+        _safe_rmtree(p / ".terraform")
 
     if d:
         if not reuse:
@@ -352,6 +380,15 @@ def run_terraform(cmd: list[str], cwd: str | Path, timeout: int) -> subprocess.C
             pass  # Already dead
         raise
 
+
+def run_terraform_init(cwd: str | Path, timeout: int) -> subprocess.CompletedProcess:
+    """terraform init với global lock để tránh file lock trên Windows.
+
+    Gọi thay cho run_terraform(tf_init_cmd(), cwd, timeout) khi chạy --workers > 1.
+    Lock chỉ bao quanh init (vài giây); validate/plan/apply chạy song song bình thường.
+    """
+    with _TF_INIT_LOCK:
+        return run_terraform(tf_init_cmd(), cwd, timeout)
 
 
 def _checkov_bin() -> str:

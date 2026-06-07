@@ -22,7 +22,6 @@ class AgentState(TypedDict):
 
     # ── Cấu hình chạy ─────────────────────────────────────────────────────────
     terraform_plan_timeout: int  # giây — đọc từ TF_PLAN_TIMEOUT env
-    auto_destroy: bool           # True trong eval mode: destroy ngay sau apply
 
     # ── Output từng agent ─────────────────────────────────────────────────────
     # A1: JSON plan mô tả AWS resources cần tạo
@@ -48,14 +47,17 @@ class AgentState(TypedDict):
     # A4: kết quả validate/plan/checkov + routing hint cho node tiếp theo
     # Schema: {"overall_passed": bool, "error_type": str|None,
     #          "root_cause": "engineering"|"architecture"|None,
-    #          "fix_instruction": str|None, "checkov": {...},
-    #          "unmet_checks": [...], "phantom_checks": [...],
+    #          "fix_instruction": str|None, "error_label": str|None,
+    #          "error_stage": str|None, "checkov": {...},
+    #          "applicable_failed_checks": [...], "not_applicable_checks": [...],
+    #          "security_degraded": bool,
     #          "validate_passed": bool, "plan_passed": bool}
     # A5 ghi đè fix_feedback khi cần route lại A3/A1 sau apply fail.
     fix_feedback: dict
 
     # A5: kết quả terraform apply
     # Schema: {"success": bool, "error_type": str|None,
+    #          "error_label": str|None, "cleanup_error_label": str|None,
     #          "resources_created": [...], "apply_raw_error": str,
     #          "partial_apply_destroyed": bool, "destroy_failed": bool}
     deployment_result: dict

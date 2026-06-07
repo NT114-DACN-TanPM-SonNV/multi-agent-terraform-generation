@@ -22,10 +22,9 @@ from graph import build_initial_state, RECURSION_LIMIT
 from evaluate import _select_graph
 
 
-def run(prompt: str, no_deploy: bool = False,
-        auto_destroy: bool = False) -> dict:
+def run(prompt: str, no_deploy: bool = False) -> dict:
     g = _select_graph(no_deploy)
-    state = build_initial_state(prompt, auto_destroy=auto_destroy)
+    state = build_initial_state(prompt)
 
     print(f"\nprompt: {prompt}\n")
 
@@ -75,7 +74,7 @@ def run(prompt: str, no_deploy: bool = False,
                 dr = update.get("deployment_result") or {}
                 if dr.get("success"):
                     created = dr.get("resources_created", [])
-                    destroyed = "→ destroyed" if dr.get("auto_destroyed") else ""
+                    destroyed = "→ destroyed" if dr.get("destroyed") else ""
                     print(f"[A5] deployment → OK  {created} {destroyed}")
                 else:
                     print(f"[A5] deployment → FAIL({dr.get('error_type')}): "
@@ -93,11 +92,9 @@ if __name__ == "__main__":
     parser.add_argument("prompt", nargs="?",
                         default="Create an S3 bucket with versioning and SSE enabled.")
     parser.add_argument("--no-deploy",  action="store_true")
-    parser.add_argument("--no-destroy", action="store_true")
     args = parser.parse_args()
 
-    final = run(args.prompt, no_deploy=args.no_deploy,
-                auto_destroy=not args.no_destroy)
+    final = run(args.prompt, no_deploy=args.no_deploy)
 
     fb = final.get("fix_feedback") or {}
     dr = final.get("deployment_result") or {}

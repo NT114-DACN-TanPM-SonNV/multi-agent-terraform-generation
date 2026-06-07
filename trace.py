@@ -7,10 +7,10 @@ Mỗi bước in:
   • Tại sao pipeline đi tiếp theo hướng đó
 
 Chạy:
-    python trace.py
     python trace.py "Create a Lambda function with SQS trigger"
     python trace.py --no-deploy "Create a VPC with public and private subnets"
-    python trace.py --no-deploy "Create an RDS PostgreSQL instance"
+    python trace.py dataset/data-dev.csv --cases 17
+    python trace.py --csv dataset/data-dev.csv --cases 0 3 7-10
 """
 import argparse
 import csv
@@ -46,6 +46,7 @@ for _n in ("httpx", "httpcore", "openai", "botocore", "boto3", "urllib3",
     logging.getLogger(_n).setLevel(logging.ERROR)
 
 from graph import build_initial_state, RECURSION_LIMIT
+from core.terraform import _safe_rmtree
 from core.retry_control import (
     MAX_VAL_ARCH_RETRY, MAX_DEPLOY_ARCH_RETRY,
     MAX_VAL_ENG_RETRY,  MAX_DEPLOY_ENG_RETRY,
@@ -56,6 +57,16 @@ _MAX_ENG_RETRY  = MAX_VAL_ENG_RETRY  + MAX_DEPLOY_ENG_RETRY   # 5 tổng 2 phase
 _MAX_SEC_RETRY  = MAX_VAL_SEC_RETRY                            # 2
 _MAX_DEPLOY_TOTAL_RETRY = MAX_DEPLOY_TOTAL_RETRY               # 4 deploy-phase backstop
 from evaluate import _select_graph
+
+
+def _clean_trace_tf_dir(run_dir: Path) -> None:
+    """Remove stale Terraform workdir before a trace case starts.
+
+    Trace reuses tmp/trace/tf across runs so old terraform.tfstate can make the
+    next row refresh unrelated resources. Clean only the local workdir before a
+    case; A5 still keeps state during the run if destroy fails.
+    """
+    _safe_rmtree(run_dir / "tf")
 
 
 # ── CSV helpers ──────────────────────────────────────────────────────────────
@@ -155,7 +166,7 @@ _AGENT_ROLE = {
         "    LOGIC            → A3 fix code rồi apply lại\n"
         "    MISSING_RESOURCE → A1 re-plan (AWS resource phụ thuộc thiếu)\n"
         "    OTHER            → requires_human (lỗi không xác định hoặc hết budget)\n"
-        "  Nếu auto_destroy=True (eval mode): terraform destroy ngay sau apply thành công."
+        "  Sau apply thành công: terraform destroy ngay để không tốn tiền AWS."
     ),
     "requires_human": (
         "Pipeline không thể tự giải quyết — hết budget retry hoặc gặp lỗi không thể tự sửa.\n"
@@ -341,10 +352,7 @@ def _explain_input(node: str, state: dict) -> None:
         code = state.get("generated_code", "")
         _note("→ A5 nhận generated_code (đã qua validation A4) và chạy terraform apply thật")
         _item("state['generated_code']", f"{len(code)} chars")
-        _item("state['auto_destroy']",
-              state.get("auto_destroy", False),
-              color=yellow if state.get("auto_destroy") else dim)
-        _note("→ auto_destroy=True trong eval mode: destroy ngay sau apply để không tốn tiền AWS")
+        _note("→ sau apply thành công, A5 destroy ngay để không tốn tiền AWS")
         deploy_r = _rc(state, "deploy")
         if deploy_r > 0:
             _item("retries[deploy_eng+deploy_arch]['count']", deploy_r, color=yellow)
@@ -382,6 +390,7 @@ def _explain_output(node: str, update: dict, state_before: dict) -> None:
             fb = update.get("fix_feedback") or {}
             _note("→ A1 FAILED — LLM call lỗi hoặc response không parse được")
             _item("fix_feedback['error_type']", fb.get("error_type", "?"), color=red)
+            _item("fix_feedback['error_label']", fb.get("error_label", "?"), color=yellow)
             _item("fix_feedback['fix_instruction']", (fb.get("fix_instruction") or "")[:250], color=red)
         _note("→ A1 clear fix_feedback={} khi success (báo hiệu 'ok, không phải retry')")
 
@@ -389,6 +398,9 @@ def _explain_output(node: str, update: dict, state_before: dict) -> None:
         prof = update.get("security_profile") or {}
         _note(f"→ A2 ghi security_profile: CKV check IDs cho {len(prof)} resources")
         _note("→ LLM chọn dựa trên intent + menu catalog (chỉ IDs hợp lệ cho đúng resource type)")
+        sec_status = update.get("security_status", "ok")
+        if sec_status != "ok":
+            _note(f"→ security_status={sec_status}: A2 degraded, downstream sẽ hiển thị best-effort rõ ràng")
         if prof:
             print()
             for label, info in prof.items():
@@ -409,18 +421,21 @@ def _explain_output(node: str, update: dict, state_before: dict) -> None:
             _note("→ A3 FAILED — không sinh được resource block hợp lệ sau 2 lần thử")
             _item("fix_feedback['error_type']",    fb.get("error_type", "?"),  color=red)
             _item("fix_feedback['root_cause']",    fb.get("root_cause", "?"),  color=yellow)
+            _item("fix_feedback['error_label']",    fb.get("error_label", "?"),  color=yellow)
             _item("fix_feedback['fix_instruction']",
                   (fb.get("fix_instruction") or "")[:250], color=red)
 
     elif node == "validation":
         fb     = update.get("fix_feedback") or {}
         passed = fb.get("overall_passed", False)
-        unmet  = fb.get("unmet_checks") or []
+        applicable_failed = fb.get("applicable_failed_checks") or []
 
         if passed:
             _note("→ A4 ghi overall_passed=True vào fix_feedback")
-            if unmet:
-                _note("→ có unmet_checks nhưng không block (best-effort: hết sec retry budget)")
+            if applicable_failed:
+                _note("→ có applicable_failed_checks nhưng không block (best-effort: hết sec retry budget)")
+            if fb.get("security_degraded"):
+                _note("→ security_degraded=True: A2 từng fail, nên security gate đã được best-effort bypass")
         else:
             _note("→ A4 ghi overall_passed=False + thông tin lỗi để agent retry biết cần sửa gì")
 
@@ -439,14 +454,14 @@ def _explain_output(node: str, update: dict, state_before: dict) -> None:
             if ids:
                 _note(f"   failed_ckv_ids: {ids}")
 
-        if unmet:
-            ids = [u.get("ckv_id") for u in unmet]
+        if applicable_failed:
+            ids = [u.get("ckv_id") for u in applicable_failed]
             print()
-            _note(f"→ unmet_checks {ids}: hết sec retry budget → best-effort accept, deploy tiếp")
+            _note(f"→ applicable_failed_checks {ids}: hết sec retry budget → best-effort accept, deploy tiếp")
 
-        phantom = fb.get("phantom_checks") or []
-        if phantom:
-            _note(f"→ phantom_checks {phantom}: check ID không map được sang resource trong HCL")
+        not_applicable = fb.get("not_applicable_checks") or []
+        if not_applicable:
+            _note(f"→ not_applicable_checks {not_applicable}: check ID không áp dụng được cho plan này")
 
         if not passed:
             print()
@@ -478,21 +493,27 @@ def _explain_output(node: str, update: dict, state_before: dict) -> None:
         ok_ = dr.get("success", False)
         if ok_:
             created = dr.get("resources_created", [])
-            _note(f"→ terraform apply thành công: {len(created)} resources tạo trên AWS")
+            managed = [r for r in created if not str(r).startswith("data.")]
+            data_sources = [r for r in created if str(r).startswith("data.")]
+            _note(f"→ terraform apply thành công: {len(managed)} managed resources, "
+                  f"{len(data_sources)} data sources trong state")
             print()
             for r in created:
                 print(f"    {green('✓')} {white(r)}")
-            destroyed = dr.get("auto_destroyed")
+            destroyed = dr.get("destroyed")
             print()
             if destroyed:
-                _note("→ auto_destroy: đã chạy terraform destroy ngay sau đó (eval mode)")
+                _note("→ cleanup: terraform destroy đã chạy thành công sau apply")
             else:
-                _note("→ resources vẫn còn trên AWS (auto_destroy=False)")
-            if dr.get("auto_destroy_error"):
-                _item("auto_destroy_error", dr["auto_destroy_error"][:200], color=red)
+                _note("→ cleanup chưa xác nhận thành công; kiểm tra destroy_error/state nếu cần")
+            if dr.get("destroy_error"):
+                _item("destroy_error", dr["destroy_error"][:200], color=red)
         else:
             _note("→ terraform apply thất bại")
             _item("deployment_result['error_type']", dr.get("error_type", "?"), color=red)
+            _item("deployment_result['error_label']", dr.get("error_label", "?"), color=yellow)
+            if dr.get("cleanup_error_label"):
+                _item("deployment_result['cleanup_error_label']", dr.get("cleanup_error_label"), color=yellow)
             if dr.get("apply_raw_error"):
                 _item("apply_raw_error (truncated)", dr["apply_raw_error"][:300], color=dim)
             if dr.get("fix_instruction"):
@@ -559,9 +580,9 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
         sec_r   = _rc(merged, "sec")
 
         if passed:
-            unmet = fb.get("unmet_checks") or []
-            if unmet:
-                _note("→ overall_passed=True dù có unmet_checks")
+            applicable_failed = fb.get("applicable_failed_checks") or []
+            if applicable_failed:
+                _note("→ overall_passed=True dù có applicable_failed_checks")
                 _note("   hết sec retry budget → A4 chấp nhận best-effort, không block deploy")
             else:
                 _note("→ overall_passed=True: cả 4 bước kiểm tra đều pass")
@@ -590,7 +611,7 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
                                 f"Checkov fail, A3 thêm/sửa security attributes, sec_retry={sec_r}/{_MAX_SEC_RETRY}")
                 else:
                     _note("→ hết budget sec_retry → best-effort accept, deploy tiếp")
-                    _note("   unmet_checks sẽ được ghi lại để tracking, không block")
+                    _note("   applicable_failed_checks sẽ được ghi lại để tracking, không block")
                     _arrow_next(node, "deployment", f"best-effort security, sec_retry hết ({sec_r}/{_MAX_SEC_RETRY})")
             elif et in ("SYNTAX", "LOGIC"):
                 if eng_r < _MAX_ENG_RETRY:
@@ -677,7 +698,7 @@ class _TeeWriter:
 # ── Main trace ────────────────────────────────────────────────────────────────
 
 def trace(prompt: str, no_deploy: bool = False,
-          auto_destroy: bool = False, plan_timeout: int | None = None,
+          plan_timeout: int | None = None,
           row_idx: int | None = None, quiet: bool = False,
           log_path: Path | None = None) -> dict:
     """Chạy pipeline và in trace từng bước.
@@ -689,10 +710,11 @@ def trace(prompt: str, no_deploy: bool = False,
     """
     g = _select_graph(no_deploy)
 
-    run_dir = ROOT / "tmp" / "trace"
+    base_run_dir = ROOT / "tmp" / "trace"
+    run_dir = base_run_dir / f"row_{row_idx}" if quiet and row_idx is not None else base_run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
-    state: dict = build_initial_state(prompt, auto_destroy=auto_destroy,
-                                      terraform_plan_timeout=plan_timeout)
+    _clean_trace_tf_dir(run_dir)
+    state: dict = build_initial_state(prompt, terraform_plan_timeout=plan_timeout)
     state["run_dir"] = str(run_dir)
 
     # Redirect stdout tuỳ theo quiet/log_path combination
@@ -725,7 +747,6 @@ def trace(prompt: str, no_deploy: bool = False,
         print(f"  {dim('những field nó cần và ghi lại kết quả vào field của mình.')}")
         print()
         _item("prompt", prompt)
-        _item("auto_destroy", state.get("auto_destroy"))
         _item("terraform_plan_timeout", state.get("terraform_plan_timeout"))
         print(f"  {dim('(tất cả counters, plans, code, feedback đều = 0 / empty)')}")
         print(f"  {dim('─' * _W)}")
@@ -821,7 +842,6 @@ if __name__ == "__main__":
     parser.add_argument("--out",     type=str, default=None,
                         help="Save per-run metadata to JSON file")
     parser.add_argument("--no-deploy",  action="store_true", help="Stop after A4 Validation")
-    parser.add_argument("--no-destroy", action="store_true", help="Keep resources after apply")
     parser.add_argument("--plan-timeout", type=int, default=None,
                         help="Terraform plan timeout in seconds (default: TF_PLAN_TIMEOUT env)")
     parser.add_argument("--workers", type=int, default=1,
@@ -832,12 +852,16 @@ if __name__ == "__main__":
                              "(workers=1: tee screen+file; workers>1: file only)")
     args = parser.parse_args()
 
+    # Hỗ trợ CSV path như positional argument: python trace.py dataset/data-dev.csv --cases 17
+    if args.prompt and args.prompt.endswith(".csv"):
+        args.csv = args.prompt
+        args.prompt = None
+
     from core.terraform import check_required_tools
     check_required_tools()
 
     _common = dict(
         no_deploy=args.no_deploy,
-        auto_destroy=not args.no_destroy,
         plan_timeout=args.plan_timeout,
     )
     workers = max(1, args.workers)

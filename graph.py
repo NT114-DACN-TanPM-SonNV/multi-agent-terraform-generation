@@ -126,14 +126,12 @@ def build_graph():
 
 
 def build_initial_state(prompt: str,
-                        terraform_plan_timeout: int | None = None,
-                        auto_destroy: bool = False) -> AgentState:
+                        terraform_plan_timeout: int | None = None) -> AgentState:
     """Khởi tạo đầy đủ AgentState — TypedDict không có default, thiếu field → KeyError."""
-    return {
+    plan_timeout = terraform_plan_timeout or int(os.getenv("TF_PLAN_TIMEOUT", "120"))
+    state: AgentState = {
         "prompt": prompt,
-        "auto_destroy": auto_destroy,
-        "terraform_plan_timeout": terraform_plan_timeout if terraform_plan_timeout is not None
-            else int(os.environ.get("TF_PLAN_TIMEOUT", "120")),
+        "terraform_plan_timeout": plan_timeout,
         "infrastructure_plan": {},
         "security_profile": {},
         "security_status": "ok",
@@ -154,6 +152,12 @@ def build_initial_state(prompt: str,
         "eng_error_history": [],
         "run_dir": "",
     }
+    # Guard: thêm field vào AgentState mà quên init ở đây → lỗi rõ ràng tại init,
+    # không phải KeyError mơ hồ tận trong node giữa pipeline.
+    missing = set(AgentState.__annotations__) - set(state)
+    if missing:
+        raise KeyError(f"build_initial_state thiếu field: {sorted(missing)}")
+    return state
 
 
 # Compile một lần khi import — tái dùng cho mọi lần invoke
