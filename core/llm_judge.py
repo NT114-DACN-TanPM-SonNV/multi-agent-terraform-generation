@@ -127,22 +127,3 @@ def llm_judge_single(prompt: str, hcl: str, timeout: int = 60) -> int:
         if "\"score\": 1" in raw or '"score":1' in raw:
             return 1
         return 0
-
-
-def llm_judge_batch(prompts: list[str], hcls: list[str],
-                    timeout_per: int = 60) -> list[int]:
-    """Judge nhiều row. Trả về list[0|1]."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    results = [0] * len(prompts)
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        future_to_idx = {
-            ex.submit(llm_judge_single, p, h, timeout_per): i
-            for i, (p, h) in enumerate(zip(prompts, hcls))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                logger.warning("Judge row %d error: %s", idx, e)
-    return results
