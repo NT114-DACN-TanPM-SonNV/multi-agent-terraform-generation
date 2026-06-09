@@ -26,6 +26,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 # Suppress noisy HTTP/SDK logs (httpx, httpcore, openai, botocore)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -68,6 +69,33 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 CSV_PATH = ROOT / "dataset" / "data-dev.csv"  # overridden by --csv arg
 _RESOURCE_RE = re.compile(r'resource\s+"[^"]+"\s+"[^"]+"')
 _PRINT_LOCK = threading.Lock()
+
+
+def _atomic_write_json(path: Path, data: list[dict]) -> None:
+    """Atomically save partial/final evaluation results."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(sorted(data, key=lambda r: r["row"]), indent=2, ensure_ascii=False)
+    with NamedTemporaryFile("w", encoding="utf-8", dir=str(path.parent), delete=False) as tmp:
+        tmp.write(payload)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def _load_existing_results(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[resume] cannot read existing output {path}: {type(e).__name__}: {e}")
+        return []
+    if not isinstance(data, list):
+        print(f"[resume] existing output is not a list, ignoring: {path}")
+        return []
+    good = [r for r in data if isinstance(r, dict) and isinstance(r.get("row"), int)]
+    if len(good) != len(data):
+        print(f"[resume] ignored {len(data) - len(good)} invalid existing result item(s)")
+    return good
 
 
 # ─── Variant graphs ───────────────────────────────────────────────────────────
@@ -620,17 +648,31 @@ def main():
 
     g = _select_graph(args.no_deploy)
 
+    out_path = (Path(args.out) if args.out
+                else ROOT / "reviews" / "pipeline_lg_results.json")
+    existing_results = _load_existing_results(out_path)
+    existing_by_row = {r["row"]: r for r in existing_results}
+
     rows = load_csv(args.limit)
     if args.cases:
         selected = _parse_cases(args.cases)
         rows = [(i, d, p, gt) for i, d, p, gt in rows if i in selected]
         print(f"--cases filter: {len(rows)} rows")
-    print(f"Loaded {len(rows)} rows\n")
 
-    results: list[dict] = []
+    requested_rows = {i for i, _, _, _ in rows}
+    results: list[dict] = [r for r in existing_results if r["row"] in requested_rows]
+    completed_rows = {r["row"] for r in results}
+    if completed_rows:
+        print(f"[resume] loaded {len(completed_rows)} completed row(s) from {out_path}")
+        rows = [row for row in rows if row[0] not in completed_rows]
+        print(f"[resume] remaining rows: {len(rows)}")
+
+    print(f"Loaded {len(rows)} rows\n")
     counters = {k: 0 for k in ("ok1", "ok2", "ok3", "ok4", "ok5",
                                 "fail1", "fail2", "fail3", "fail4", "fail5")}
     counter_lock = threading.Lock()
+    for r in results:
+        _update_counters(counters, r, args.no_deploy, counter_lock)
 
     def _run_one(row_args: tuple, live: bool = False) -> tuple[dict, str]:
         idx, difficulty, prompt, gt_types = row_args
@@ -663,6 +705,7 @@ def main():
                 print(f"\n  [timeout] row={idx}: vượt {args.row_timeout}s — "
                       f"thread vẫn chạy nền (không kill được; kiểm tra resource AWS).")
                 results.append(_timeout_sentinel(row_args, timeout=True))
+                _atomic_write_json(out_path, results)
                 with counter_lock:
                     counters["fail1"] += 1
                 continue
@@ -676,12 +719,14 @@ def main():
                 print(f"  [error] row={idx}: {e}")
                 import traceback; traceback.print_exc()
                 results.append(_timeout_sentinel(row_args, error=str(e)))
+                _atomic_write_json(out_path, results)
                 with counter_lock:
                     counters["fail1"] += 1
             elif _result:
                 r, _ = _result[0]
                 results.append(r)
                 _update_counters(counters, r, args.no_deploy, counter_lock)
+                _atomic_write_json(out_path, results)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             future_to_args = {
@@ -699,6 +744,7 @@ def main():
                             print(output)
                         results.append(r)
                         _update_counters(counters, r, args.no_deploy, counter_lock)
+                        _atomic_write_json(out_path, results)
                     except FuturesTimeoutError:
                         with _PRINT_LOCK:
                             print(f"  [timeout] row={idx}: vượt {args.row_timeout}s — bỏ qua. "
@@ -707,6 +753,7 @@ def main():
                         # Ghi sentinel để score.py ĐẾM row này (fail), không để nó biến mất khỏi
                         # denominator → tránh phồng pass-rate (đặc biệt case khó timeout trên v4-pro).
                         results.append(_timeout_sentinel(ra, timeout=True))
+                        _atomic_write_json(out_path, results)
                         with counter_lock:
                             counters["fail1"] += 1
                     except Exception as e:
@@ -714,6 +761,7 @@ def main():
                             print(f"  [error] row={idx}: {e}")
                             import traceback; traceback.print_exc()
                         results.append(_timeout_sentinel(ra, error=str(e)))
+                        _atomic_write_json(out_path, results)
                         with counter_lock:
                             counters["fail1"] += 1
             except KeyboardInterrupt:
@@ -736,10 +784,7 @@ def main():
     if counters["ok4"] and not args.no_deploy:
         print(f"  A5 deploy: {counters['ok5']}/{counters['ok4']}  ok")
 
-    out_path = (Path(args.out) if args.out
-                else ROOT / "reviews" / "pipeline_lg_results.json")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_json(out_path, results)
     print(f"\nSaved {len(results)} results → {out_path}")
 
 
