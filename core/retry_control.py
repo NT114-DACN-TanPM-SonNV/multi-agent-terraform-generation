@@ -18,8 +18,6 @@ Keys trong retries dict:
   deploy_arch — A5 → A1 (MISSING_RESOURCE_DEPLOY)  → bump total_deploy_attempts
   sec         — security gate trong A4 (best-effort khi hết) → bump total_val_attempts
 """
-from dataclasses import dataclass, field
-
 from core.state import AgentState, RetryTracker
 
 # ── Retry budgets — single source of truth ────────────────────────────────────
@@ -108,15 +106,3 @@ def check_retry_budget(
         return False, f"{agent} đã retry {count}/{max_retries} lần"
 
     return True, ""
-
-
-def get_retry_summary(state: AgentState) -> dict:
-    """Trả summary retry state — dùng cho logging/debug."""
-    return {
-        agent: {
-            "count": tracker["count"],
-            "last_error": tracker["last_error_type"],
-            "history": tracker["error_history"],
-        }
-        for agent, tracker in state["retries"].items()
-    }

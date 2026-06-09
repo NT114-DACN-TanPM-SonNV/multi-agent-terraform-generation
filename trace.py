@@ -9,17 +9,13 @@ Mỗi bước in:
 Chạy:
     python trace.py "Create a Lambda function with SQS trigger"
     python trace.py --no-deploy "Create a VPC with public and private subnets"
-    python trace.py dataset/data-dev.csv --cases 17
-    python trace.py --csv dataset/data-dev.csv --cases 0 3 7-10
+    python trace.py --csv dataset/data-dev.csv --case 17
 """
 import argparse
 import csv
-import io
 import json
 import re
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Force UTF-8 stdout/stderr trên Windows để tránh UnicodeEncodeError với tiếng Việt
@@ -32,7 +28,6 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 _DEFAULT_CSV = ROOT / "dataset" / "data-dev.csv"
-_PRINT_LOCK = threading.Lock()
 
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
@@ -69,32 +64,18 @@ def _clean_trace_tf_dir(run_dir: Path) -> None:
     _safe_rmtree(run_dir / "tf")
 
 
-# ── CSV helpers ──────────────────────────────────────────────────────────────
-
-def _parse_cases(tokens: list[str]) -> set[int]:
-    """Parse "0 3 7-10 15" → {0, 3, 7, 8, 9, 10, 15}."""
-    result: set[int] = set()
-    for part in tokens:
-        if "-" in part:
-            lo, hi = part.split("-", 1)
-            result.update(range(int(lo), int(hi) + 1))
-        else:
-            result.add(int(part))
-    return result
-
-
-def _load_csv_rows(csv_path: Path, limit: int | None,
-                   cases: set[int] | None) -> list[tuple[int, str, str]]:
-    """Nạp CSV → [(idx, difficulty, prompt)]. Filter theo cases/limit."""
-    rows = list(csv.DictReader(open(csv_path, encoding="utf-8")))
-    result = []
-    for i, row in enumerate(rows):
-        if cases and i not in cases:
-            continue
-        result.append((i, row.get("Difficulty", "?"), row.get("Prompt", "").strip()))
-        if limit and len(result) >= limit:
-            break
-    return result
+def _prompt_from_csv(csv_path: Path, row_index: int) -> tuple[str, str]:
+    """Read one prompt from dataset CSV by zero-based row index."""
+    with csv_path.open(encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if row_index < 0 or row_index >= len(rows):
+        raise SystemExit(f"CSV row out of range: {row_index} (n={len(rows)})")
+    row = rows[row_index]
+    prompt = (row.get("Prompt") or "").strip()
+    if not prompt:
+        raise SystemExit(f"CSV row {row_index} has empty Prompt")
+    difficulty = row.get("Difficulty", "?")
+    return prompt, difficulty
 
 
 # ── ANSI ─────────────────────────────────────────────────────────────────────
@@ -667,73 +648,25 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
                             f"không xử lý được hoặc hết budget ({deploy_r})")
 
 
-# ── Stdout redirect helpers ───────────────────────────────────────────────────
-
-class _FileWriter:
-    """Redirect stdout vào file (quiet parallel mode)."""
-    def __init__(self, path: Path):
-        self._f = open(path, "w", encoding="utf-8")
-    def write(self, s):  self._f.write(s)
-    def flush(self):     self._f.flush()
-    def close(self):     self._f.close()
-    # argparse / logging dùng isatty()
-    def isatty(self):    return False
-
-
-class _TeeWriter:
-    """Tee stdout ra cả screen lẫn file (workers=1 + --log-dir)."""
-    def __init__(self, path: Path, real_stdout):
-        self._f = open(path, "w", encoding="utf-8")
-        self._s = real_stdout
-    def write(self, s):
-        self._f.write(s)
-        self._s.write(s)
-    def flush(self):
-        self._f.flush()
-        self._s.flush()
-    def close(self):     self._f.close()
-    def isatty(self):    return False
-
-
 # ── Main trace ────────────────────────────────────────────────────────────────
 
 def trace(prompt: str, no_deploy: bool = False,
-          plan_timeout: int | None = None,
-          row_idx: int | None = None, quiet: bool = False,
-          log_path: Path | None = None) -> dict:
-    """Chạy pipeline và in trace từng bước.
-
-    quiet=True  + log_path=None : suppress hoàn toàn (parallel không log)
-    quiet=True  + log_path=file : ghi vào file, không ra screen
-    quiet=False + log_path=file : tee ra cả screen lẫn file
-    quiet=False + log_path=None : chỉ screen (default)
-    """
+          plan_timeout: int | None = None) -> dict:
+    """Chạy pipeline cho một prompt và in trace từng bước."""
     g = _select_graph(no_deploy)
 
-    base_run_dir = ROOT / "tmp" / "trace"
-    run_dir = base_run_dir / f"row_{row_idx}" if quiet and row_idx is not None else base_run_dir
+    run_dir = ROOT / "tmp" / "trace"
     run_dir.mkdir(parents=True, exist_ok=True)
     _clean_trace_tf_dir(run_dir)
     state: dict = build_initial_state(prompt, terraform_plan_timeout=plan_timeout)
     state["run_dir"] = str(run_dir)
 
-    # Redirect stdout tuỳ theo quiet/log_path combination
     _real_stdout = sys.stdout
     _writer = None
-    if log_path and quiet:
-        _writer = _FileWriter(log_path)
-        sys.stdout = _writer
-    elif log_path and not quiet:
-        _writer = _TeeWriter(log_path, _real_stdout)
-        sys.stdout = _writer
-    elif quiet:
-        sys.stdout = io.StringIO()
     try:
         # ── Header ────────────────────────────────────────────────────────────
         print(f"\n{BOLD}{white('█' * _W)}{R}")
         print(f"{BOLD}{white('  PIPELINE TRACE — Multi-Agent Terraform Generation')}{R}")
-        if row_idx is not None:
-            print(f"{BOLD}{white(f'  Row #{row_idx}')}{R}")
         print(f"{BOLD}{white('  LangGraph StateGraph: A1 → A2 → A3 → A4 → A5')}{R}")
         print(f"{BOLD}{white('█' * _W)}{R}")
         print(f"\n  {dim('prompt:')} {white(bold(prompt))}")
@@ -822,128 +755,53 @@ def trace(prompt: str, no_deploy: bool = False,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description=(
-            "Pipeline trace — step-by-step walkthrough of the multi-agent system.\n\n"
-            "Single prompt:  python trace.py \"Create an S3 bucket\"\n"
-            "CSV dataset:    python trace.py --csv dataset/data-dev.csv --cases 0 3 7-10\n"
-            "               python trace.py --csv dataset/data-dev.csv --limit 5 --no-deploy"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Trace one prompt through the multi-agent Terraform pipeline.",
     )
-    parser.add_argument("prompt", nargs="?",
-                        default=None,
-                        help="Prompt IaC trực tiếp (bỏ qua nếu dùng --csv)")
-    parser.add_argument("--csv",     type=str, default=None,
-                        help=f"CSV dataset path (default: {_DEFAULT_CSV.name})")
-    parser.add_argument("--cases",   nargs="+", default=None,
-                        help="Row indices from CSV, e.g. --cases 0 3 7-10 15")
-    parser.add_argument("--limit",   type=int, default=None,
-                        help="Max rows from CSV (default: no limit)")
-    parser.add_argument("--out",     type=str, default=None,
-                        help="Save per-run metadata to JSON file")
-    parser.add_argument("--no-deploy",  action="store_true", help="Stop after A4 Validation")
-    parser.add_argument("--plan-timeout", type=int, default=None,
-                        help="Terraform plan timeout in seconds (default: TF_PLAN_TIMEOUT env)")
-    parser.add_argument("--workers", type=int, default=1,
-                        help="Parallel workers for CSV mode (default: 1 = full trace output; "
-                             ">1 = quiet mode, only summary printed)")
-    parser.add_argument("--log-dir", type=str, default=None,
-                        help="Save each row's trace to <log-dir>/row_<N>.txt "
-                             "(workers=1: tee screen+file; workers>1: file only)")
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="IaC prompt to trace",
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help=f"Dataset CSV path (default: {_DEFAULT_CSV})",
+    )
+    parser.add_argument(
+        "--case",
+        type=int,
+        default=0,
+        help="Zero-based row index when using --csv",
+    )
+    parser.add_argument(
+        "--no-deploy",
+        action="store_true",
+        help="Stop after A4 Validation",
+    )
+    parser.add_argument(
+        "--plan-timeout",
+        type=int,
+        default=None,
+        help="Terraform plan timeout in seconds",
+    )
     args = parser.parse_args()
 
-    # Hỗ trợ CSV path như positional argument: python trace.py dataset/data-dev.csv --cases 17
-    if args.prompt and args.prompt.endswith(".csv"):
-        args.csv = args.prompt
-        args.prompt = None
+    if args.csv:
+        csv_path = args.csv
+        if not csv_path.is_absolute():
+            csv_path = ROOT / csv_path
+        prompt, difficulty = _prompt_from_csv(csv_path, args.case)
+        print(f"Trace CSV row {args.case} | difficulty={difficulty} | csv={csv_path}")
+    else:
+        prompt = args.prompt or "Create an S3 bucket with versioning and server-side encryption."
 
     from core.terraform import check_required_tools
     check_required_tools()
 
-    _common = dict(
+    trace(
+        prompt,
         no_deploy=args.no_deploy,
         plan_timeout=args.plan_timeout,
     )
-    workers = max(1, args.workers)
-    log_dir = Path(args.log_dir) if args.log_dir else None
-    if log_dir:
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-    results = []
-
-    if args.csv or args.cases or args.limit:
-        # ── CSV mode ──────────────────────────────────────────────────────────
-        csv_path = Path(args.csv) if args.csv else _DEFAULT_CSV
-        cases = _parse_cases(args.cases) if args.cases else None
-        rows = _load_csv_rows(csv_path, args.limit, cases)
-        if not rows:
-            print(red("Không có row nào khớp với filter."))
-            sys.exit(1)
-
-        quiet_mode = workers > 1
-        mode_label = f"workers={workers} (quiet)" if quiet_mode else "sequential (full trace)"
-        print(f"\n{bold(white(f'Trace {len(rows)} row(s) from {csv_path.name}  [{mode_label}]'))}")
-
-        def _run_row(args_tuple):
-            idx, difficulty, prompt = args_tuple
-            lp = (log_dir / f"row_{idx}.txt") if log_dir else None
-            final = trace(prompt, row_idx=idx, quiet=quiet_mode, log_path=lp, **_common)
-            fb = final.get("fix_feedback") or {}
-            dr = final.get("deployment_result") or {}
-            return {
-                "row": idx, "difficulty": difficulty, "prompt": prompt,
-                "overall_passed": fb.get("overall_passed"),
-                "validate_passed": fb.get("validate_passed"),
-                "plan_passed": fb.get("plan_passed"),
-                "deployment_success": dr.get("success"),
-                "total_val_attempts": _rc(final, "total"),
-            }
-
-        if workers == 1:
-            for idx, difficulty, prompt in rows:
-                print(f"\n{yellow('─' * _W)}")
-                p_short = prompt[:60] + "..." if len(prompt) > 60 else prompt
-                print(yellow(f"  ROW {idx}  |  difficulty={difficulty}  |  {p_short}"))
-                print(f"{yellow('─' * _W)}")
-                results.append(_run_row((idx, difficulty, prompt)))
-        else:
-            # Parallel: quiet mode, print summary khi mỗi row xong
-            completed = 0
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                future_map = {pool.submit(_run_row, r): r for r in rows}
-                for fut in as_completed(future_map):
-                    completed += 1
-                    row_args = future_map[fut]
-                    try:
-                        r = fut.result()
-                    except Exception as e:
-                        idx, diff, pmt = row_args
-                        r = {"row": idx, "difficulty": diff, "prompt": pmt,
-                             "overall_passed": False, "error": str(e)[:120]}
-                    results.append(r)
-                    ok = r.get("overall_passed")
-                    mark = green("✓") if ok else red("✗")
-                    with _PRINT_LOCK:
-                        print(f"  {mark} [{completed:2d}/{len(rows)}] "
-                              f"row={r['row']} diff={r.get('difficulty','?')} "
-                              f"passed={ok} attempts={r.get('total_val_attempts',0)}")
-    else:
-        # ── Single prompt mode ────────────────────────────────────────────────
-        prompt = args.prompt or "Create an S3 bucket with versioning and server-side encryption."
-        lp = (log_dir / "row_single.txt") if log_dir else None
-        final = trace(prompt, log_path=lp, **_common)
-        fb = final.get("fix_feedback") or {}
-        dr = final.get("deployment_result") or {}
-        results.append({
-            "row": None, "prompt": prompt,
-            "overall_passed": fb.get("overall_passed"),
-            "validate_passed": fb.get("validate_passed"),
-            "plan_passed": fb.get("plan_passed"),
-            "deployment_success": dr.get("success"),
-            "total_val_attempts": _rc(final, "total"),
-        })
-
-    if args.out:
-        out_path = Path(args.out)
-        out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"\n{green('✓')} Saved {len(results)} result(s) → {out_path}")
