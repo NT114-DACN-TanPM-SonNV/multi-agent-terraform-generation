@@ -1,3 +1,4 @@
+# ── System prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 You are the Validation Agent in a Terraform generation pipeline.
 A generated Terraform configuration failed checks. Classify the failure and provide a precise fix.
@@ -9,10 +10,12 @@ Output (raw JSON only):
 }
 
 ── Note ──────────────────────────────────────────────────────────────
-SYNTAX: dùng cho plan error khi terraform config sai (backend, provider block)
-LOGIC: dùng cho plan error khi attribute/value sai
-MISSING_RESOURCE: dùng cho plan error khi resource/dependency boundary sai hoặc
-external data source lookup không tìm thấy object cần thiết
+SYNTAX: use for Terraform configuration/schema errors such as backend,
+provider block, unsupported argument/block, or invalid HCL structure.
+LOGIC: use for plan-time value/constraint errors where the resource boundary is
+correct but an attribute, block value, or combination is wrong.
+MISSING_RESOURCE: use when a required resource/dependency is absent from the
+architecture boundary, or an external data source lookup finds no object.
 
 ── Classification ────────────────────────────────────────────────────────────
 SYNTAX          HCL is structurally invalid: undeclared reference, missing required argument,
@@ -31,61 +34,37 @@ MISSING_RESOURCE  Plan failed because a required resource/dependency is absent f
                 the plan.
 
 ── fix_instruction rules ─────────────────────────────────────────────────────
-1. ANALYZE CONTEXT FIRST:
-   - Read "CURRENT HCL OF AFFECTED RESOURCE(S)" to see what exists now
-   - Read "ERROR HISTORY" to see what errors keep repeating
-   - Read "PREVIOUSLY ATTEMPTED FIXES" to avoid repeating failed fixes
-
-2. ALWAYS name the exact resource label (e.g. aws_db_instance.main).
-
-3. DETAILED ACTION: describe EXACTLY what to add/change:
-   - SYNTAX: which block/argument is wrong → show correct format with example
-   - LOGIC: which attribute has wrong value → show correct value and why
-   - MISSING_RESOURCE: resource/dependency boundary to change → explain whether
-     Architecture should add a managed resource or keep an explicit existing data source
-   - Do not invent required arguments that are not named by Terraform's error.
-
-4. CONTEXT MATTERS:
-   - For LOGIC: explain WHY the value is wrong (constraint, format, reference)
-   - For MISSING_RESOURCE: explain which existing resource depends on it, or
-     which data source lookup failed because the external object was absent
-   - Reference code context if available
-   - Preserve explicit user intent from ORIGINAL USER REQUEST and
-     INFRASTRUCTURE PLAN. If a plan attribute/block came from the user's
-     request, do not fix by deleting it. Fix the incompatible generated default
-     instead.
-   - Numeric/capacity/version settings from the user are hard requirements.
-     If they conflict with a generated default, instruct Engineering to change
-     the default to a compatible value rather than removing the requested
-     setting.
-   - If Terraform says an attribute is "unconfigurable", "computed", "read-only",
-     or "decided automatically", the fix is to remove that attribute, not to set
-     or keep it.
-   - Do not suggest setting provider-computed fields to make a plan pass.
-
-5. COMPLETENESS:
-   - Do NOT suggest incomplete fixes. Include ALL required arguments.
-   - Do NOT use placeholders like "your-value" — use concrete examples from context.
-   - If unsure, reference the error message for hints.
-
-6. AVOID REPETITION:
-   - Check "PREVIOUSLY ATTEMPTED FIXES" — if similar fix failed, suggest different approach.
-
+1. Read current affected HCL, error history, and attempted fixes before deciding.
+2. Always name the exact resource label.
+3. Give one precise action:
+   - SYNTAX: wrong block/argument and correct format
+   - LOGIC: wrong attribute/value, correct value, and constraint/reason
+   - MISSING_RESOURCE: boundary change, dependency, and whether Architecture
+     should add a managed resource or keep an explicit external data source
+4. Preserve explicit user intent and hard numeric/capacity/version settings. Fix
+   incompatible generated defaults instead of deleting requested properties.
+5. Do not invent required arguments absent from Terraform's error. Unsupported
+   arg/block => remove or relocate that exact item. Computed/read-only attribute
+   => remove it. Name uniqueness/format error => preserve semantic naming intent
+   with a deploy-safe existing argument, preferring prefix/name_prefix/bucket_prefix
+   when supported. Do not add random/helper resources or interpolation strings
+   unless the plan already contains them or Architecture must change the boundary.
+6. Be complete and concrete: include all required arguments, avoid placeholders,
+   and avoid repeating previously failed fixes.
 7. Return ONLY raw JSON. No markdown, no explanation.\
 """
 
+# ── Prompt wrappers ──────────────────────────────────────────────────────────
 TOP_PROMPT = "Terraform configuration failed. Classify and fix:\n\n"
 
 BOTTOM_PROMPT = "\nOutput JSON with error_type and fix_instruction only."
 
-# ── Error-handling prompts (Agent 4) ──────────────────────────────────────────
-# Các template dưới đây lồng giữa TOP_PROMPT/BOTTOM_PROMPT (hoặc gửi thẳng cho Agent 3
-# làm fix_instruction). Dữ liệu nội suy qua str.format — giá trị thay vào KHÔNG bị format
-# lại nên ngoặc {} trong HCL/JSON an toàn.
+# ── Error-handling context ───────────────────────────────────────────────────
+# Prompt fragments inserted between TOP_PROMPT and BOTTOM_PROMPT. Values are
+# interpolated once with str.format; embedded HCL/JSON braces are safe.
 
-# NOTE: VALIDATE_FIX, SECURITY_FIX moved to agents/validation.py (agent templates, not LLM prompts)
-#
-# PLAN_CONTEXT: context data for LLM classify (still here as it's a prompt component)
+# NOTE: VALIDATE_FIX and SECURITY_FIX live in agents/validation.py because they
+# are direct fix templates, not LLM classification prompts.
 PLAN_CONTEXT = (
     "ORIGINAL USER REQUEST:\n{prompt}\n\n"
     "INFRASTRUCTURE PLAN:\n{plan}\n\n"

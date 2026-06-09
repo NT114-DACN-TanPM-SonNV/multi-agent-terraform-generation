@@ -1,3 +1,4 @@
+# ── System prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 You are the Deployment Agent in a Terraform generation pipeline.
 A terraform apply to real AWS infrastructure failed. Classify the error and provide a fix.
@@ -34,21 +35,31 @@ OTHER           Terminal errors that cannot be fixed by changing HCL:
                 plan and IS fixable — classify as LOGIC, not OTHER.
 
 ── Context guidance ──────────────────────────────────────────────────────────
-- PARTIAL APPLY / DESTROYED: state cleanup context — focus fix_instruction on the code
-  change, not on cleanup.
-- SUSPECTED FAILED RESOURCE: start analysis here, then confirm against APPLY ERROR.
-- RESOURCE LIST: use to verify a resource type exists before classifying FIXABLE.
-  If the type is absent from the list, prefer MISSING_RESOURCE over FIXABLE.
+- For partial apply/destroyed cases, focus fix_instruction on code, not cleanup.
+- Start from SUSPECTED FAILED RESOURCE, then confirm against APPLY ERROR.
+- Use RESOURCE LIST to classify: absent required type => MISSING_RESOURCE; editable
+  existing block/value => LOGIC.
+- For constrained names rejected by AWS, change an existing name/prefix argument
+  to a deploy-safe equivalent. Treat example-like/common literals in global or
+  account-unique namespaces as semantic naming intent, not exact identity, unless
+  the request explicitly requires that external identifier. Prefer provider-native
+  prefix/name_prefix/bucket_prefix when supported on the same resource; otherwise
+  use another provider-supported deploy-safe name argument. Do not suggest
+  helper/random resources or literal interpolation strings.
+- For invalid source/location/endpoint/artifact/object/image/credential/connection,
+  fix the producer-consumer relationship. If the producer object is absent from
+  RESOURCE LIST, classify MISSING_RESOURCE instead of rewriting strings.
 - Return ONLY raw JSON. No markdown, no explanation.\
 """
 
+# ── Prompt wrappers ──────────────────────────────────────────────────────────
 TOP_PROMPT = "terraform apply failed. Classify and fix:\n\n"
 
 BOTTOM_PROMPT = "\nOutput JSON with error_type and fix_instruction only."
 
-# ── Error-handling prompt (Agent 5) ───────────────────────────────────────────
-# Context phân loại lỗi terraform apply, lồng giữa TOP_PROMPT/BOTTOM_PROMPT. Nội suy qua
-# str.format — giá trị thay vào KHÔNG bị format lại nên ngoặc {} trong JSON/HCL an toàn.
+# ── Error-handling context ───────────────────────────────────────────────────
+# Prompt fragment inserted between TOP_PROMPT and BOTTOM_PROMPT. Values are
+# interpolated once with str.format; embedded HCL/JSON braces are safe.
 CLASSIFY_CONTEXT = (
     "RESOURCE LIST: {labels}\n"
     "SUSPECTED FAILED RESOURCE: {failed}\n\n"
