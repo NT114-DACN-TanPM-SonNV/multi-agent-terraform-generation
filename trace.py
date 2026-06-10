@@ -355,8 +355,10 @@ def _explain_output(node: str, update: dict, state_before: dict) -> None:
             fb = update.get("fix_feedback") or {}
             _note("→ A1 FAILED — LLM call lỗi hoặc response không parse được")
             _item("fix_feedback['error_type']", fb.get("error_type", "?"), color=red)
-            _item("fix_feedback['error_label']", fb.get("error_label", "?"), color=yellow)
+            _item("fix_feedback['error_stage']", fb.get("error_stage", "?"), color=yellow)
             _item("fix_feedback['fix_instruction']", (fb.get("fix_instruction") or "")[:250], color=red)
+            if fb.get("raw_error"):
+                _item("raw_error (truncated)", fb["raw_error"][:250], color=dim)
         _note("→ A1 clear fix_feedback={} khi success (báo hiệu 'ok, không phải retry')")
 
     elif node == "security":
@@ -634,15 +636,14 @@ def _explain_routing(node: str, update: dict, merged: dict) -> None:
 
 # ── Main trace ────────────────────────────────────────────────────────────────
 
-def trace(prompt: str, no_deploy: bool = False,
-          plan_timeout: int | None = None) -> dict:
+def trace(prompt: str, no_deploy: bool = False) -> dict:
     """Chạy pipeline cho một prompt và in trace từng bước."""
     g = _select_graph(no_deploy)
 
     run_dir = ROOT / "tmp" / "trace"
     run_dir.mkdir(parents=True, exist_ok=True)
     _clean_trace_tf_dir(run_dir)
-    state: dict = build_initial_state(prompt, terraform_plan_timeout=plan_timeout)
+    state: dict = build_initial_state(prompt)
     state["run_dir"] = str(run_dir)
 
     _real_stdout = sys.stdout
@@ -664,7 +665,6 @@ def trace(prompt: str, no_deploy: bool = False,
         print(f"  {dim('những field nó cần và ghi lại kết quả vào field của mình.')}")
         print()
         _item("prompt", prompt)
-        _item("terraform_plan_timeout", state.get("terraform_plan_timeout"))
         print(f"  {dim('(tất cả counters, plans, code, feedback đều = 0 / empty)')}")
         print(f"  {dim('─' * _W)}")
 
@@ -764,12 +764,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Stop after A4 Validation",
     )
-    parser.add_argument(
-        "--plan-timeout",
-        type=int,
-        default=None,
-        help="Terraform plan timeout in seconds",
-    )
     args = parser.parse_args()
 
     if args.csv:
@@ -787,5 +781,4 @@ if __name__ == "__main__":
     trace(
         prompt,
         no_deploy=args.no_deploy,
-        plan_timeout=args.plan_timeout,
     )

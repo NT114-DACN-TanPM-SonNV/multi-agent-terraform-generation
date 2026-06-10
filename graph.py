@@ -24,10 +24,7 @@ TRANSIENT retry (network/throttle) của A5 xảy ra IN-NODE (vòng lặp 2 lầ
 deployment_node) — không cần edge riêng vì không thay đổi state giữa các lần thử.
 """
 import logging
-import os
-
 from langgraph.graph import StateGraph, START, END
-
 from core.state import AgentState
 from core.retry_control import new_tracker
 from agents.architecture import architecture_node
@@ -47,17 +44,6 @@ RECURSION_LIMIT = 150
 
 
 def route_after_architecture(state: AgentState) -> str:
-    """Conditional edge sau A1. KHÔNG ghi state.
-
-    Tại sao cần?
-    A1 fail → make_fail("INFRASTRUCTURE") chỉ set fix_feedback, KHÔNG set infrastructure_plan.
-    Nếu cứ xuôi A2→A3→A4, A4 thấy code rỗng → MISSING_RESOURCE → route về A1 → loop
-    đốt cạn total_val_attempts mà không sửa được gì.
-
-    Tại sao check error_type thay vì infrastructure_plan rỗng?
-    A1 success luôn clear fix_feedback={}, nên error_type chỉ tồn tại khi A1 vừa fail.
-    Không nhầm với stale feedback từ MISSING_RESOURCE re-plan.
-    """
     fb = state.get("fix_feedback") or {}
     if fb.get("error_type") == "INFRASTRUCTURE":
         return "requires_human"
@@ -65,12 +51,6 @@ def route_after_architecture(state: AgentState) -> str:
 
 
 def route_after_engineering(state: AgentState) -> str:
-    """Conditional edge sau A3. KHÔNG ghi state.
-
-    A3 chỉ trả INFRASTRUCTURE (LLM timeout, không sinh được resource block).
-    Không route về A4 với code bad/rỗng vì A4 sẽ chấm nhầm code cũ hoặc
-    sinh MISSING_RESOURCE giả → lãng phí retry budget.
-    """
     fb = state.get("fix_feedback") or {}
     if not fb.get("error_type"):
         return "validation"
@@ -125,13 +105,10 @@ def build_graph():
     return g.compile()
 
 
-def build_initial_state(prompt: str,
-                        terraform_plan_timeout: int | None = None) -> AgentState:
+def build_initial_state(prompt: str) -> AgentState:
     """Khởi tạo đầy đủ AgentState — TypedDict không có default, thiếu field → KeyError."""
-    plan_timeout = terraform_plan_timeout or int(os.getenv("TF_PLAN_TIMEOUT", "120"))
     state: AgentState = {
         "prompt": prompt,
-        "terraform_plan_timeout": plan_timeout,
         "infrastructure_plan": {},
         "security_profile": {},
         "security_status": "ok",

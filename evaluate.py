@@ -257,8 +257,8 @@ def _extract_results(
         if not ok:
             fb = final_state.get("fix_feedback") or {}
             archi_result["error"] = fb.get("fix_instruction", "unknown")
-            archi_result["error_label"] = fb.get("error_label")
             archi_result["error_stage"] = fb.get("error_stage")
+            archi_result["raw_error"] = (fb.get("raw_error") or "")[:2000]
 
     # secu
     secu_result = None
