@@ -67,6 +67,23 @@ PATCH_HEADER = (
 PREV_CODE_HEADER = "\n\nPREVIOUS CODE (keep everything except the fix):\n"
 PREV_ERRORS_HEADER = "\n\nPREVIOUS ERRORS (do NOT reintroduce these):\n"
 
+BOUNDARY_RETRY = """\
+Your HCL violates the Architecture plan boundary.
+
+Fix these defects:
+{defects}
+
+Rules:
+- Do not add managed resources that are not in the plan.
+- Do not remove managed resources that are in the plan.
+- Do not add data sources that are not in the plan.
+- Do not remove data sources that are in the plan.
+- Do not add terraform backend or module blocks.
+- If a planned resource needs an external object that is not in the plan, keep the
+  resource boundary intact and let validation route the missing dependency to Architecture.
+- Return the complete corrected Terraform HCL only.\
+"""
+
 # Retry prompt when the LLM output contains no resource block.
 NO_RESOURCE_RETRY = (
     "Your response did not contain any `resource \"` blocks. "

@@ -9,30 +9,28 @@ will not appear here.
 
 Output (raw JSON only):
 {
-  "error_type": "LOGIC | MISSING_RESOURCE | OTHER",
+  "error_type": "LOGIC | MISSING_RESOURCE | UNKNOWN",
   "fix_instruction": "<specific instruction, or null>"
 }
 
 ── Classification ────────────────────────────────────────────────────────────
-LOGIC           The HCL is wrong and can be corrected by editing existing resource blocks.
+LOGIC           Apply-time value/constraint error: an attribute or block value is wrong.
                 Decision test: can this be fixed by changing an attribute value or block
                 without adding or removing resource declarations?
                 fix_instruction: name the exact resource label, attribute, and required value.
 
-MISSING_RESOURCE  Apply failed because a required AWS resource is entirely absent from the
-                plan — not misconfigured, but never declared.
+MISSING_RESOURCE  A required AWS resource or data source is entirely absent from the plan —
+                not misconfigured, but never declared.
                 fix_instruction: name the resource type to add and which existing resource
                 needs it.
 
-OTHER           Terminal errors that cannot be fixed by changing HCL:
-                  - PERMISSION: AWS credentials lack required IAM permission
-                  - QUOTA: Service limit reached (requires AWS limit increase)
-                  - UNKNOWN: Error does not fit any category above
-                fix_instruction: null for all OTHER errors.
+UNKNOWN         Error does not fit LOGIC or MISSING_RESOURCE, or is too ambiguous
+                to classify safely.
+                fix_instruction: null for UNKNOWN errors.
 
                 Note: if the error is about a resource's IAM role lacking permissions (e.g.
-                CodeBuild, Lambda, ECS task role missing an action), that role EXISTS in the
-                plan and IS fixable — classify as LOGIC, not OTHER.
+                CodeBuild task role missing an action), that role EXISTS in the plan and IS
+                fixable by adding a policy — classify as LOGIC, not UNKNOWN.
 
 ── Context guidance ──────────────────────────────────────────────────────────
 - For partial apply/destroyed cases, focus fix_instruction on code, not cleanup.
