@@ -8,13 +8,16 @@ Tách rời khỏi việc CHẠY pipeline (evaluate.py) để: (a) chấm lại 
 mỗi file là list các row dict có: row, difficulty, engi.generated_code,
 val.plan_ok, deploy.ok, total_retry_count.
 
-Thước đo (xem core/metrics.METRIC_DEFS):
-  • plan_valid       — tất định (val.plan_ok)
-  • semantic_correct — tất định, Rego gold (recompute, cần --rego + opa + AWS creds)
-  • security_score   — tất định, full Checkov scan (recompute, cần --checkov)
-  • deploy_success   — phụ thuộc môi trường (deploy.ok)
-  • resolved@≤k      — nội bộ: giải quyết trong ≤ k vòng iteration
-  • pass@k           — chuẩn: ước lượng trên các run độc lập (≥2 file)
+Thước đo:
+  • plan_valid        — terraform validate + plan pass
+  • resource_f1       — type match với ground truth
+  • llm_judge         — semantic adequacy mềm (tuỳ chọn)
+  • security_row_mean — mean per-task Checkov pass rate (headline security)
+  • clean_rate        — % task có 0 failed Checkov checks
+  • deploy_success    — chỉ có nếu results có deploy
+  • secure_deploy     — deploy_ok và 0 failed Checkov checks
+  • plan_resolved@≤k  — plan-level resolved trong ≤ k vòng iteration
+  • deploy_resolved@≤k — deploy-level resolved trong ≤ k vòng iteration, nếu có deploy
 
 Chạy:
   python score.py reviews/run1.json --csv dataset/data-test.csv --rego --checkov
@@ -51,11 +54,16 @@ def _code_of(row: dict) -> str:
 
 
 def _success_signal(scored: dict, has_deploy: bool, has_rego: bool) -> bool:
-    """Tín hiệu 'thành công' mạnh nhất hiện có cho resolved@≤k."""
+    """Tín hiệu success cho cross-run pass@k."""
     if has_rego and scored.get("semantic_correct") is not None:
         return bool(scored["semantic_correct"])
     if has_deploy and scored.get("deploy_success") is not None:
         return bool(scored["deploy_success"])
+    return bool(scored.get("plan_valid"))
+
+
+def _plan_success_signal(scored: dict) -> bool:
+    """Resolved@<=k trong bảng chung là plan-level để fair với baseline plan-only."""
     return bool(scored.get("plan_valid"))
 
 
@@ -75,6 +83,10 @@ def _score_row(run_row: dict, gold: dict, do_rego: bool, do_checkov: bool,
         "semantic_correct": None,
         "llm_judge": None,
         "security_score": None,
+        "security_passed": None,
+        "security_failed": None,
+        "security_total": None,
+        "security_clean": None,
         "total_elapsed_s": run_row.get("total_elapsed_s"),
         "resource_f1": (run_row.get("resource_match") or {}).get("f1"),
     }
@@ -85,13 +97,10 @@ def _score_row(run_row: dict, gold: dict, do_rego: bool, do_checkov: bool,
         scored["semantic_correct"] = res["correct"]
         scored["_rego_stage"] = res["stage"]
 
-    if do_judge:
-        if code.strip():
-            from core.llm_judge import llm_judge_single
-            prompt = run_row.get("prompt") or gold.get("Prompt", "")
-            scored["llm_judge"] = llm_judge_single(prompt, code)
-        else:
-            scored["llm_judge"] = 0  # không sinh được code = inadequate; giữ /N để cùng mẫu số với plan_valid
+    if do_judge and code.strip():
+        from core.llm_judge import llm_judge_single
+        prompt = run_row.get("prompt") or gold.get("Prompt", "")
+        scored["llm_judge"] = llm_judge_single(prompt, code)
 
     # security_score = full Checkov pass-rate (HEADLINE; check_ids=None = grader độc lập, held-out
     # với A2 vốn Checkov-free). CHỈ credit khi code DEPLOY ĐƯỢC (≥ plan_valid): TF an toàn mà không
@@ -103,9 +112,11 @@ def _score_row(run_row: dict, gold: dict, do_rego: bool, do_checkov: bool,
         try:
             ck = run_checkov_on_hcl(code, timeout=90, check_ids=None)
             total = ck["passed_count"] + ck["failed_count"]
+            scored["security_passed"] = ck["passed_count"]
+            scored["security_failed"] = ck["failed_count"]
+            scored["security_total"] = total
             scored["security_score"] = rate(ck["passed_count"], total) if total else None
-            scored["_ck_passed"] = ck["passed_count"]   # để tính aggregate (pooled) trong summary
-            scored["_ck_total"] = total
+            scored["security_clean"] = (ck["failed_count"] == 0) if total else None
         except Exception as e:
             scored["_checkov_error"] = str(e)[:120]
 
@@ -135,18 +146,26 @@ def _summarize_run(scored_rows: list[dict], has_deploy: bool, has_rego: bool) ->
     sem_ok = sum(1 for r in sem_rows if r["semantic_correct"])
     judge_rows = [r for r in scored_rows if r.get("llm_judge") is not None]
     judge_ok = sum(1 for r in judge_rows if r["llm_judge"] == 1)
+    sec_vals = [r["security_score"] for r in scored_rows if r.get("security_score") is not None]
     sec_rows = [r for r in scored_rows if r.get("security_score") is not None]
-    sec_vals = [r["security_score"] for r in sec_rows]
-    sec_agg_passed = sum(r.get("_ck_passed", 0) for r in sec_rows)
-    sec_agg_total = sum(r.get("_ck_total", 0) for r in sec_rows)
+    sec_passed = sum(r.get("security_passed") or 0 for r in sec_rows)
+    sec_total = sum(r.get("security_total") or 0 for r in sec_rows)
+    clean_rows = [r for r in sec_rows if r.get("security_clean") is not None]
+    clean_ok = sum(1 for r in clean_rows if r.get("security_clean"))
+    secure_deploy_ok = sum(1 for r in sec_rows
+                           if r.get("deploy_success") and r.get("security_clean"))
     elapsed_vals = [r["total_elapsed_s"] for r in scored_rows if r.get("total_elapsed_s") is not None]
     f1_vals = [r["resource_f1"] for r in scored_rows if r.get("resource_f1") is not None]
 
     resolved = {}
     for k in range(1, _MAX_K + 1):
         ok = sum(1 for r in scored_rows
-                 if _success_signal(r, has_deploy, has_rego) and r["attempts"] <= k)
+                 if _plan_success_signal(r) and r["attempts"] <= k)
         resolved[f"resolved@<={k}"] = rate(ok, n)
+        if has_deploy:
+            dep_ok = sum(1 for r in scored_rows
+                         if r.get("deploy_success") and r["attempts"] <= k)
+            resolved[f"deploy_resolved@<={k}"] = rate(dep_ok, n)
 
     return {
         "n": n,
@@ -156,11 +175,12 @@ def _summarize_run(scored_rows: list[dict], has_deploy: bool, has_rego: bool) ->
         "llm_judge": rate(judge_ok, len(judge_rows)) if judge_rows else None,
         "llm_judge_n": len(judge_rows),
         "deploy_success": rate(deploy_ok, n) if has_deploy else None,
-        "security_score": round(sum(sec_vals) / len(sec_vals), 4) if sec_vals else None,
-        "security_score_agg": round(sec_agg_passed / sec_agg_total, 4) if sec_agg_total else None,
-        "security_passed": sec_agg_passed,   # LƯỢNG tuyệt đối — coverage thật, không bị tỉ lệ giấu
-        "security_total": sec_agg_total,
+        "security_row_mean": round(sum(sec_vals) / len(sec_vals), 4) if sec_vals else None,
+        "security_micro": rate(sec_passed, sec_total) if sec_total else None,
+        "clean_rate": rate(clean_ok, len(clean_rows)) if clean_rows else None,
         "security_n": len(sec_vals),
+        "security_total_checks": sec_total,
+        "secure_deploy": rate(secure_deploy_ok, n) if has_deploy and sec_rows else None,
         # Tỷ lệ run mà A2 hỏng (LLM fail) → 0 security enforcement KHÔNG do intent.
         # Cao = kết quả security đang bị nhiễu bởi lỗi hạ tầng, cần điều tra trước khi tin số.
         "security_degraded_rate": rate(sum(1 for r in scored_rows if r.get("security_degraded")), n),
@@ -174,7 +194,8 @@ def _summarize_run(scored_rows: list[dict], has_deploy: bool, has_rego: bool) ->
                                           if r.get("plan_valid") and not r.get("security_unmet")
                                           and not r.get("security_phantom")
                                           and not r.get("security_degraded")), n),
-        "time_to_deploy_mean": round(sum(elapsed_vals) / len(elapsed_vals), 1) if elapsed_vals else None,
+        "avg_time": round(sum(elapsed_vals) / len(elapsed_vals), 1) if elapsed_vals else None,
+        "avg_retry": round(sum((r.get("attempts") or 1) - 1 for r in scored_rows) / n, 2) if n else None,
         "resource_f1_mean":    round(sum(f1_vals) / len(f1_vals), 4) if f1_vals else None,
         **resolved,
     }
@@ -275,25 +296,38 @@ def main():
         if s.get("llm_judge") is not None:
             print(f"  llm_judge        : {s['llm_judge']:.3f}   "
                   f"[adequacy judge (deepseek-chat), n={s['llm_judge_n']}]")
-        if s["security_score"] is not None:
-            print(f"  security_score   : {s['security_score']:.3f} (mean) | "
-                  f"{s['security_score_agg']:.3f} (agg = {s['security_passed']}/{s['security_total']} checks pass)   "
-                  f"[n={s['security_n']}]")
+        if s["security_row_mean"] is not None:
+            print(f"  security_row_mean: {s['security_row_mean']:.3f}   "
+                  f"[headline: mean per-task Checkov pass-rate, n={s['security_n']}]")
+            if s.get("clean_rate") is not None:
+                print(f"  clean_rate       : {s['clean_rate']:.3f}   [0 failed Checkov checks]")
+            if s.get("security_micro") is not None:
+                print(f"  security_micro   : {s['security_micro']:.3f}   "
+                      f"[secondary: total pass/total checks, checks={s['security_total_checks']}]")
         if s["deploy_success"] is not None:
             print(f"  deploy_success   : {s['deploy_success']:.3f}   [env-dependent]")
-        if s.get("time_to_deploy_mean") is not None:
-            print(f"  time_to_deploy   : {s['time_to_deploy_mean']:.1f}s  [mean per row]")
+        if s.get("secure_deploy") is not None:
+            print(f"  secure_deploy    : {s['secure_deploy']:.3f}   [deploy_ok AND clean Checkov]")
+        if s.get("avg_time") is not None:
+            print(f"  avg_time         : {s['avg_time']:.1f}s  [mean per row]")
+        if s.get("avg_retry") is not None:
+            print(f"  avg_retry        : {s['avg_retry']:.2f}   [mean per row]")
         if s.get("resource_f1_mean") is not None:
             print(f"  resource_f1      : {s['resource_f1_mean']:.3f}   [type match vs ground truth]")
-        print("  resolved@<=k     : " +
+        print("  plan_resolved@<=k: " +
               "  ".join(f"k={k}:{s[f'resolved@<={k}']:.3f}" for k in range(1, _MAX_K + 1)))
+        if s["deploy_success"] is not None:
+            print("  deploy_resolved@<=k: " +
+                  "  ".join(f"k={k}:{s[f'deploy_resolved@<={k}']:.3f}" for k in range(1, _MAX_K + 1)))
         print("  by difficulty:")
         for diff, d in s["by_difficulty"].items():
             sem = f" sem={d['semantic_correct']:.2f}" if d["semantic_correct"] is not None else ""
-            print(f"    {diff:<8} n={d['n']:<3} plan_valid={d['plan_valid']:.2f}{sem}")
+            sec = f" sec={d['security_row_mean']:.2f}" if d["security_row_mean"] is not None else ""
+            dep = f" deploy={d['deploy_success']:.2f}" if d["deploy_success"] is not None else ""
+            print(f"    {diff:<8} n={d['n']:<3} plan_valid={d['plan_valid']:.2f}{sem}{sec}{dep}")
     bci = cross_run.get("success_bootstrap_ci95")
     if bci:
-        print(f"\n▶ Success rate (task-level bootstrap): {bci['mean']:.3f} "
+        print(f"\n▶ Success signal (task-level bootstrap): {bci['mean']:.3f} "
               f"[{bci['ci95_lo']:.3f}, {bci['ci95_hi']:.3f}] 95% CI (n_tasks={bci['n']})")
     if cross_run.get("pass_at_k"):
         print("▶ Cross-run (independent samples):")

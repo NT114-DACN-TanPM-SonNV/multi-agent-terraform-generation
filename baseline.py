@@ -1,29 +1,36 @@
-"""Baseline B0/B1 — ablation so sánh với multi-agent pipeline.
+"""Baseline B0/B1/B2 — ablation so sánh với multi-agent pipeline.
 
-B0 (--retry 0): 1 LLM call, không retry — single-shot baseline.
-B1 (--retry 3): tối đa 3 repair iteration với tf error feedback — Multi-turn baseline.
-  → Budget retry bằng val_eng của pipeline (3) để so sánh fair.
+B0 (--retry 0): Direct pass@1, prompt gốc, không security prompt.
+B1 (--retry N): Direct + Terraform plan repair, không security prompt.
+B2 (--retry N --security-prompt): Direct + security prompt + Terraform plan repair.
+
+Retry N nên match MAX_VAL_ENG_RETRY của framework để so plan-level fair.
 
 Schema output tương thích score.py → chấm bằng cùng thước đo.
 
 Chạy:
-  python baseline.py --csv dataset/data-test.csv --out reviews/b0.json
-  python baseline.py --csv dataset/data-test.csv --retry 3 --out reviews/b1.json
-  python baseline.py --csv dataset/data-test.csv --retry 3 --limit 5
+  python baseline.py --csv dataset/data-test.csv --retry 0 --out results/b0_direct.json
+  python baseline.py --csv dataset/data-test.csv --retry 2 --out results/b1_direct_retry.json
+  python baseline.py --csv dataset/data-test.csv --retry 2 --security-prompt --out results/b2_security_retry.json
 """
 import argparse
 import csv
 import json
 import logging
-import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / ".env")
@@ -35,11 +42,14 @@ from agents.engineering import _strip_preamble
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-_SYSTEM = """\
+_BASE_SYSTEM = """\
 You are TerraformAI, an expert that writes Terraform configurations for AWS.
 Given a request, output a single complete, valid, deployable Terraform HCL configuration
 using the AWS provider ~> 5.0. Include the terraform{} and provider "aws" blocks.
 
+Output ONLY raw HCL — no markdown fences, no explanation."""
+
+_SECURITY_GUIDANCE = """\
 Apply AWS security best practices where applicable:
 - Encrypt data at rest (KMS or provider-managed encryption)
 - Encrypt data in transit (TLS, enforce HTTPS)
@@ -55,17 +65,23 @@ _VALIDATE_TIMEOUT = 60
 _DECLARED_RE = re.compile(r'(?:resource|data)\s+"([^"]+)"\s+"[^"]+"')
 
 
-def _generate_hcl(prompt: str) -> str:
-    raw = call_llm([{"role": "system", "content": _SYSTEM},
+def _system_prompt(security_prompt: bool) -> str:
+    if security_prompt:
+        return f"{_BASE_SYSTEM}\n\n{_SECURITY_GUIDANCE}"
+    return _BASE_SYSTEM
+
+
+def _generate_hcl(prompt: str, security_prompt: bool) -> str:
+    raw = call_llm([{"role": "system", "content": _system_prompt(security_prompt)},
                     {"role": "user", "content": prompt}], agent="engineering")
     body = _strip_preamble(strip_code_block(raw).strip())
     return f"{body}\n" if 'resource "' in body else ""
 
 
-def _repair_hcl(prompt: str, code: str, error: str) -> str:
-    """Feed lỗi tf vào LLM để sửa — kiểu Multi-turn của MACog."""
+def _repair_hcl(prompt: str, code: str, error: str, security_prompt: bool) -> str:
+    """Feed lỗi tf vào cùng single agent để sửa."""
     messages = [
-        {"role": "system", "content": _SYSTEM},
+        {"role": "system", "content": _system_prompt(security_prompt)},
         {"role": "user", "content": prompt},
         {"role": "assistant", "content": code},
         {"role": "user", "content": (
@@ -126,12 +142,13 @@ def _resource_comparison(gt_types: list[str], gen_types: list[str]) -> dict:
     }
 
 
-def run_row(prompt: str, gt_types: list[str], plan_timeout: int, max_retry: int) -> dict:
-    """Chạy 1 row với retry loop. max_retry=0 → B0, max_retry>0 → B1."""
+def run_row(prompt: str, gt_types: list[str], plan_timeout: int,
+            max_retry: int, security_prompt: bool) -> dict:
+    """Chạy 1 row với retry loop. max_retry=0 -> pass@1."""
     t0 = time.time()
 
     try:
-        code = _generate_hcl(prompt)
+        code = _generate_hcl(prompt, security_prompt)
     except Exception as e:
         code = ""
 
@@ -142,7 +159,7 @@ def run_row(prompt: str, gt_types: list[str], plan_timeout: int, max_retry: int)
         if not code.strip():
             break
         try:
-            code = _repair_hcl(prompt, code, err)
+            code = _repair_hcl(prompt, code, err, security_prompt)
         except Exception:
             break
         retries += 1
@@ -164,17 +181,17 @@ def run_row(prompt: str, gt_types: list[str], plan_timeout: int, max_retry: int)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Baseline B0 / B1 cho ablation")
+    ap = argparse.ArgumentParser(description="Baseline B0/B1/B2 cho ablation")
     ap.add_argument("--csv",          required=True)
     ap.add_argument("--limit",        type=int, default=None)
     ap.add_argument("--cases",        nargs="+", default=None,
                     help="Row indices, e.g. --cases 0 1 2 5 7-10")
     ap.add_argument("--out",          default="reviews/baseline_b0.json")
-    ap.add_argument("--plan-timeout", type=int,
-                    default=int(os.getenv("TF_PLAN_TIMEOUT", "120")),
-                    help="Mặc định = TF_PLAN_TIMEOUT trong .env (khớp pipeline graph.py:131)")
+    ap.add_argument("--plan-timeout", type=int, default=120)
     ap.add_argument("--retry",        type=int, default=0,
-                    help="Số lần repair tối đa: 0=B0 (no retry), 3=B1 (with retry)")
+                    help="Số lần repair tối đa: 0=B0; B1/B2 nên match MAX_VAL_ENG_RETRY")
+    ap.add_argument("--security-prompt", action="store_true",
+                    help="Bật security best-practice guidance cho strong baseline B2")
     ap.add_argument("--workers",      type=int, default=1,
                     help="Số worker song song (mặc định 1)")
     args = ap.parse_args()
@@ -195,7 +212,12 @@ def main():
     else:
         rows = list(enumerate(rows))
 
-    label = "B0" if args.retry == 0 else f"B1(retry≤{args.retry})"
+    if args.retry == 0 and not args.security_prompt:
+        label = "B0-direct-pass@1"
+    elif args.security_prompt:
+        label = f"B2-security+plan-retry≤{args.retry}"
+    else:
+        label = f"B1-direct+plan-retry≤{args.retry}"
     print(f"{label}  |  csv={Path(args.csv).name}  |  n={len(rows)}  |  workers={args.workers}")
 
     print_lock = threading.Lock()
@@ -207,7 +229,7 @@ def main():
         gt_raw   = row.get("Resource") or ""
         gt_types = [t.strip() for t in gt_raw.split(",") if t.strip()]
 
-        r = run_row(prompt, gt_types, args.plan_timeout, args.retry)
+        r = run_row(prompt, gt_types, args.plan_timeout, args.retry, args.security_prompt)
 
         with print_lock:
             print(f"row {orig_idx:3d} [{diff:<6}] plan_valid={r['plan_ok']} "
@@ -218,6 +240,12 @@ def main():
             "row":        orig_idx,
             "difficulty": diff,
             "prompt":     prompt,
+            "baseline": {
+                "mode": label,
+                "security_prompt": args.security_prompt,
+                "retry_budget": args.retry,
+                "scope": "plan-only",
+            },
             "archi": {"ok": r["n_res"] > 0, "resource_count": r["n_res"]},
             "secu":  {"ok": True, "skipped": True, "security_profile": {}},
             "engi":  {
