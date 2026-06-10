@@ -71,9 +71,9 @@ Return ONLY raw JSON. No markdown. No explanation.\
 ARCH_FIX_HEADER = "REQUIRED CHANGE:\n{fix_instruction}"
 ARCH_PREV_ATTEMPTS = "\n\nPREVIOUS ATTEMPTS (do NOT repeat):\n"
 
-# In-node repair prompt when A1 detects structural/semantic plan defects.
+# In-node repair prompt when A1 detects structural plan defects.
 DEFECT_FIX = (
-    "Your previous plan has problems:\n{defects}\n\n"
+    "Your previous plan has structural problems:\n{defects}\n\n"
     "Return the COMPLETE corrected plan as raw JSON. Every resource and data source must "
     "have both 'type' and 'name', and no two may share the same type.name. Keep all the "
     "user-requested infrastructure and exact properties — fix the problems without adding "
