@@ -1,14 +1,4 @@
 # 🏗️ A Multi-Agent Framework for Secure and Deployable AWS Terraform Code Generation
-
-Sinh **Terraform HCL** từ mô tả ngôn ngữ tự nhiên bằng pipeline **5 agent chuyên biệt**
-(Architecture → Security → Engineering → Validation → Deployment) orchestrate bằng
-**LangGraph**, có các vòng tự sửa (retry), security gate (Checkov), và deploy thật lên AWS.
-
-> 🎯 **Mục tiêu:** code vừa **đúng intent**, vừa **secure**, vừa **deploy được** — không chỉ
-> "chạy được terraform plan".
-
----
-
 ## 📑 Mục lục
 
 1. [⚙️ Yêu cầu & Setup](#️-yêu-cầu--setup)
@@ -19,7 +9,6 @@ Sinh **Terraform HCL** từ mô tả ngôn ngữ tự nhiên bằng pipeline **5
 6. [📊 Metric đánh giá](#-metric-đánh-giá)
 7. [⚖️ So sánh Baseline vs Pipeline](#️-so-sánh-baseline-vs-pipeline)
 8. [📁 Cấu trúc thư mục](#-cấu-trúc-thư-mục)
-9. [🛠️ Troubleshooting](#️-troubleshooting)
 
 ---
 
@@ -296,27 +285,5 @@ cleanup.py       Dọn tài nguyên AWS rò rỉ
 tmp/             Terraform working dirs (tự cleanup)
 reviews/         Kết quả evaluation JSON
 .tf_plugin_cache/ Provider cache offline (đổ bằng scripts/populate_provider_cache.py)
-```
 
-### 🧹 Dọn tài nguyên AWS
-
-Mặc định `auto-destroy` tự `terraform destroy` sau mỗi apply thành công. Khi destroy fail
-hoặc row timeout giữa apply → `python cleanup.py` dọn thủ công.
-
----
-
-## 🛠️ Troubleshooting
-
-| Triệu chứng | Xử lý |
-|-------------|-------|
-| `python is not recognized` | Python chưa trong PATH — cài lại, tick "Add to PATH" |
-| `terraform/checkov not found` | `where terraform` / `where checkov` → thêm PATH hoặc set `CHECKOV_BIN` trong `.env` |
-| AWS credentials không hợp lệ | `aws configure` hoặc điền `.env` |
-| `init failed: locked provider ... does not match` | Lock cũ bị cache: `Remove-Item -Recurse tmp\*\.terraform`, `Remove-Item tmp\*\.terraform.lock.hcl` |
-| OPA không tìm thấy | Tải `opa_windows_amd64.exe` → đổi tên `opa.exe` → đặt vào PATH |
-| init fail "provider not found" | `.tf_plugin_cache` trống → chạy lại `python scripts/populate_provider_cache.py` |
-
-```powershell
-deactivate    # tắt venv
-```
 ```
