@@ -20,6 +20,7 @@ Rules:
   unsupported schema, or broken relationships.
 
 Return ONLY raw JSON.\
+s
 """
 
 # ── User template ────────────────────────────────────────────────────────────

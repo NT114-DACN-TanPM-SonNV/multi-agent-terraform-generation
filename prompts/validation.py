@@ -23,6 +23,7 @@ Fix rules:
 - Do not invent unsupported arguments.
 
 Return ONLY raw JSON.\
+
 """
 
 # ── Classify template ────────────────────────────────────────────────────────

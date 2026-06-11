@@ -25,6 +25,7 @@ Rules:
   add random/helper resources.
 
 Return ONLY raw HCL.\
+
 """
 
 # ── User template ────────────────────────────────────────────────────────────

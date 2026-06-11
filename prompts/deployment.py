@@ -26,6 +26,7 @@ Rules:
   producer-consumer relationship; if producer is absent, MISSING_RESOURCE.
 
 Return ONLY raw JSON.\
+
 """
 
 # ── Classify template ────────────────────────────────────────────────────────

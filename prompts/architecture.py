@@ -27,6 +27,7 @@ Rules:
   fields when needed; do not add random/helper resources.
 
 Return ONLY raw JSON.\
+
 """
 
 # ── Repair templates ─────────────────────────────────────────────────────────
