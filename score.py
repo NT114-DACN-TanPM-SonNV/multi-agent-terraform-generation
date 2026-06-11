@@ -155,7 +155,6 @@ def _summarize_run(scored_rows: list[dict], has_deploy: bool, has_rego: bool) ->
     sec_passed = sum(r.get("security_passed") or 0 for r in sec_rows)
     sec_total = sum(r.get("security_total") or 0 for r in sec_rows)
     elapsed_vals = [r["total_elapsed_s"] for r in scored_rows if r.get("total_elapsed_s") is not None]
-    first_val_vals = [r["first_val_pass_s"] for r in scored_rows if r.get("first_val_pass_s") is not None]
     f1_vals = [r["resource_f1"] for r in scored_rows if r.get("resource_f1") is not None]
 
     resolved = {}
@@ -195,13 +194,10 @@ def _summarize_run(scored_rows: list[dict], has_deploy: bool, has_rego: bool) ->
                                           if r.get("plan_valid") and not r.get("security_unmet")
                                           and not r.get("security_phantom")
                                           and not r.get("security_degraded")), n),
-        # avg_time_valid = tới khi A4 pass lần đầu (chất lượng sinh code A1→A4);
-        # avg_time_total = tổng cả run (gồm deploy + retry).
-        "avg_time_valid": round(sum(first_val_vals) / len(first_val_vals), 1) if first_val_vals else None,
-        "avg_time_total": round(sum(elapsed_vals) / len(elapsed_vals), 1) if elapsed_vals else None,
-        # avg_retry_valid = retry trong pha tạo code valid (A1→A4); avg_retry_total = cả run.
-        "avg_retry_valid": round(sum(r.get("val_retry_count") or 0 for r in scored_rows) / n, 2) if n else None,
-        "avg_retry_total": round(sum((r.get("attempts") or 1) - 1 for r in scored_rows) / n, 2) if n else None,
+        # avg_time/avg_retry theo total_elapsed_s + total_retry_count của file đó.
+        # (Plan-stage vs full đã tách bằng FILE riêng: framework.json vs framework_plan.json.)
+        "avg_time":  round(sum(elapsed_vals) / len(elapsed_vals), 1) if elapsed_vals else None,
+        "avg_retry": round(sum((r.get("attempts") or 1) - 1 for r in scored_rows) / n, 2) if n else None,
         "resource_f1_mean":    round(sum(f1_vals) / len(f1_vals), 4) if f1_vals else None,
         **resolved,
     }
@@ -310,14 +306,10 @@ def main():
                       f"[secondary: total pass/total checks, checks={s['security_total_checks']}]")
         if s["deploy_success"] is not None:
             print(f"  deploy_success   : {s['deploy_success']:.3f}   [env-dependent]")
-        if s.get("avg_time_valid") is not None:
-            print(f"  avg_time_valid   : {s['avg_time_valid']:.1f}s  [mean tới A4 pass lần đầu]")
-        if s.get("avg_time_total") is not None:
-            print(f"  avg_time_total   : {s['avg_time_total']:.1f}s  [mean tổng cả run]")
-        if s.get("avg_retry_valid") is not None:
-            print(f"  avg_retry_valid  : {s['avg_retry_valid']:.2f}   [mean retry pha A1→A4]")
-        if s.get("avg_retry_total") is not None:
-            print(f"  avg_retry_total  : {s['avg_retry_total']:.2f}   [mean retry cả run]")
+        if s.get("avg_time") is not None:
+            print(f"  avg_time         : {s['avg_time']:.1f}s  [mean per row]")
+        if s.get("avg_retry") is not None:
+            print(f"  avg_retry        : {s['avg_retry']:.2f}   [mean per row]")
         if s.get("resource_f1_mean") is not None:
             print(f"  resource_f1      : {s['resource_f1_mean']:.3f}   [type match vs ground truth]")
         print("  plan_resolved@<=k: " +
