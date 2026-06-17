@@ -52,7 +52,7 @@ TRANSIENT_PATTERNS = (
     "tls handshake timeout", "no such host", "dial tcp",
     "reset by peer", "unexpected eof", "requesttimeout",
     "requestlimitexceeded", "throttling", "rate exceeded",
-    "vpcquotaexceeded", "limitexceeded",
+    "vpcquotaexceeded",
     "failed to query available provider packages", "registry error",  # init-specific
     "validating provider credentials", "retrieving caller identity",
     "request send failed", "statuscode: 0",

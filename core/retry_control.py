@@ -6,13 +6,13 @@ MAX_VAL_ENG_RETRY = 2
 MAX_VAL_ARCH_RETRY = 2
 MAX_VAL_SEC_RETRY = 1
 
-MAX_DEPLOY_ENG_RETRY = 2
+MAX_DEPLOY_ENG_RETRY = 3
 MAX_DEPLOY_ARCH_RETRY = 2
 
 # Backstop TỔNG mỗi pha = tổng các per-route (tự cập nhật nếu chỉnh cap per-route).
 # Chặn case xen kẽ route mà mỗi route chưa chạm cap riêng nhưng tổng vượt → loop.
 MAX_VAL_TOTAL_RETRY    = MAX_VAL_ENG_RETRY + MAX_VAL_ARCH_RETRY + MAX_VAL_SEC_RETRY  # 5
-MAX_DEPLOY_TOTAL_RETRY = MAX_DEPLOY_ENG_RETRY + MAX_DEPLOY_ARCH_RETRY                # 4
+MAX_DEPLOY_TOTAL_RETRY = MAX_DEPLOY_ENG_RETRY + MAX_DEPLOY_ARCH_RETRY                # 5
 
 def new_tracker() -> RetryTracker:
     """Return a fresh mutable retry tracker."""
@@ -49,11 +49,6 @@ def increment_retry(
             "error_history": history,
         },
     }
-    # A5 failures count toward the deploy backstop; everything else counts toward validation.
-    if agent in ("deploy_eng", "deploy_arch"):
-        state["total_deploy_attempts"] = state["total_deploy_attempts"] + 1
-    else:
-        state["total_val_attempts"] = state["total_val_attempts"] + 1
 
 
 def check_retry_budget(
@@ -67,7 +62,7 @@ def check_retry_budget(
         return True, ""
 
     count = tracker["count"]
-    if count >= max_retries:
+    if count > max_retries:
         return False, f"{agent} đã retry {count}/{max_retries} lần"
 
     return True, ""

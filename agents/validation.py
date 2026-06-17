@@ -22,7 +22,7 @@ from core.terraform import (
 )
 from core.retry_control import (
     increment_retry, check_retry_budget,
-    MAX_VAL_SEC_RETRY, MAX_VAL_TOTAL_RETRY,
+    MAX_VAL_ENG_RETRY, MAX_VAL_ARCH_RETRY, MAX_VAL_SEC_RETRY, MAX_VAL_TOTAL_RETRY,
 )
 from core.errors import (
     matches_any,
@@ -146,8 +146,6 @@ def _fail_result(state: AgentState, error_type: str, root_cause: str,
     """Return fixable error (SYNTAX, LOGIC, MISSING_RESOURCE). Route to A3/A1 for fix."""
     assert error_type in ("SYNTAX", "LOGIC", "MISSING_RESOURCE"), \
         f"_fail_result: unexpected error_type '{error_type}'"
-    state["total_val_attempts"] += 1
-    new_total = state["total_val_attempts"]
     is_eng = error_type in ("SYNTAX", "LOGIC")
     is_arch = error_type == "MISSING_RESOURCE"
 
@@ -155,6 +153,8 @@ def _fail_result(state: AgentState, error_type: str, root_cause: str,
         increment_retry(state, "val_eng", error_type, raw_error[:200])
     elif is_arch:
         increment_retry(state, "val_arch", error_type, raw_error[:200])
+    state["total_val_attempts"] += 1
+    new_total = state["total_val_attempts"]
 
     return {
         "fix_feedback": {
@@ -173,12 +173,11 @@ def _fail_result(state: AgentState, error_type: str, root_cause: str,
 
 
 def _security_result(state: AgentState, applicable_failed: list[tuple[str, str, str]],
-                     checkov: dict, not_applicable: list | None = None,
-                     retry_allowed: bool = True) -> dict:
+                     checkov: dict, not_applicable: list | None = None) -> dict:
     """Return SECURITY error. Applicable failed checks found, route A3 to fix."""
+    increment_retry(state, "sec", "SECURITY", str(sorted({cid for _a, cid, _n in applicable_failed})))
     state["total_val_attempts"] += 1
     new_total = state["total_val_attempts"]
-    increment_retry(state, "sec", "SECURITY", str(sorted({cid for _a, cid, _n in applicable_failed})))
     fix_instruction = _SECURITY_FIX_TEMPLATE.format(
         items="\n".join(f"- {addr}: {name}" for addr, _id, name in applicable_failed)
     )
@@ -191,7 +190,6 @@ def _security_result(state: AgentState, applicable_failed: list[tuple[str, str, 
             "checkov": checkov,
             "applicable_failed_checks": [{"resource": a, "ckv_id": i, "name": n} for a, i, n in applicable_failed],
             "not_applicable_checks": list(not_applicable or []),
-            "retry_allowed": retry_allowed,
             "validate_passed": True, "plan_passed": True,
         },
         "retries": state["retries"],
@@ -318,8 +316,6 @@ def _run_validate_phase(state: AgentState, d: str) -> dict | None:
         validate_err = ((val.stderr or "") + "\n" + (val.stdout or "")).strip()
         fix = _VALIDATE_FIX_TEMPLATE.format(
             validate_err=validate_err[:1500],
-            facts="",
-            code_ctx="",
         )
         return _fail_result(state, "SYNTAX", "engineering", fix, {}, False, False, raw_error=validate_err[:2000])
 
@@ -437,12 +433,23 @@ def _run_security_gate(state: AgentState, code: str, plan_json_str: str | None) 
     evaluated = set(checkov.get("passed_ckv_ids", [])) | set(checkov.get("failed_ckv_ids", []))
     not_applicable = sorted(target_ids - evaluated)
 
-    # Route: applicable failed + budget → A3 fix | else → best-effort pass
+    # Route: applicable failed → A3 fix (budget checked in router); else → best-effort pass
     if applicable_failed:
-        can_retry, reason = check_retry_budget(state, "sec", max_retries=MAX_VAL_SEC_RETRY)
-        if can_retry:
-            return _security_result(state, applicable_failed, checkov, not_applicable, retry_allowed=True)
-        logger.info("Agent 4: security gate BEST-EFFORT — %s; not_applicable=%d", reason, len(not_applicable))
+        # If sec budget already exhausted, take best-effort path directly so validation.ok=True
+        sec_count = ((state.get("retries") or {}).get("sec") or {}).get("count", 0)
+        if sec_count >= MAX_VAL_SEC_RETRY:
+            logger.info("Agent 4: security BEST-EFFORT (sec %d/%d — budget exhausted)",
+                        sec_count, MAX_VAL_SEC_RETRY)
+            result = _success_result(checkov, applicable_failed, not_applicable, security_degraded=True)
+            result["routing_log"] = state["routing_log"] + [{
+                "round": state["total_val_attempts"] + 1,
+                "error_type": "SECURITY",
+                "root_cause": None,
+                "fix_instruction": "security gate best-effort — budget exhausted, proceeding to deployment",
+                "predicted_route": "deployment",
+            }]
+            return result
+        return _security_result(state, applicable_failed, checkov, not_applicable)
 
     logger.info("Agent 4: security gate BEST-EFFORT — security ok; not_applicable=%d", len(not_applicable))
     return _success_result(checkov, applicable_failed, not_applicable)
@@ -483,10 +490,18 @@ def validation_node(state: AgentState) -> dict:
         # Plan succeeded — continue to security gate
         if plan_err:
             # Plan fail with error classification needed
+            # Previous fix attempts (eng + arch route) → cho LLM tránh lặp lại fix đã fail
+            # (principle 3). Rỗng khi chưa có lịch sử; cap 5 dòng để không phình prompt.
+            _prev = [h.get("fix_instruction", "") for h in
+                     (state.get("eng_error_history") or []) + (state.get("arch_error_history") or [])]
+            _prev = [p for p in _prev if p][-5:]
+            prev_fixes = ("\n\nPREVIOUS FIX ATTEMPTS (already tried — do NOT repeat; try a "
+                          "different approach):\n" + "\n".join(f"- {p}" for p in _prev)) if _prev else ""
             ctx = CLASSIFY_TEMPLATE.format(
                 prompt=state.get("prompt", ""),
                 plan=json.dumps(state.get("infrastructure_plan") or {}, ensure_ascii=False),
                 plan_err=plan_err[:1500],
+                prev_fixes=prev_fixes,
             )
             error_type, root_cause, fix_instruction = _llm_classify(
                 ctx, {"SYNTAX", "LOGIC", "MISSING_RESOURCE", "UNKNOWN"}, "UNKNOWN",
@@ -518,13 +533,28 @@ def route_after_validation(state: AgentState) -> str:
     if fb.get("error_type") == "INFRASTRUCTURE":
         return "requires_human"
     if fb.get("error_type") == "SECURITY":
-        return "engineering" if fb.get("retry_allowed") else "deployment"
+        can_retry, reason = check_retry_budget(state, "sec", max_retries=MAX_VAL_SEC_RETRY)
+        if can_retry:
+            return "engineering"
+        logger.info("Agent 4: security gate BEST-EFFORT — %s", reason)
+        return "deployment"
 
     rc = fb.get("root_cause")
+    # Fallback: infer root_cause from error_type if missing
+    if not rc:
+        et = fb.get("error_type")
+        if et == "MISSING_RESOURCE":
+            rc = "architecture"
+        elif et in ("SYNTAX", "LOGIC"):
+            rc = "engineering"
+        else:
+            return "requires_human"
+
     if rc not in ("engineering", "architecture"):
         return "requires_human"
 
-    can_retry, _ = check_retry_budget(state, "val_eng" if rc == "engineering" else "val_arch")
+    max_r = MAX_VAL_ENG_RETRY if rc == "engineering" else MAX_VAL_ARCH_RETRY
+    can_retry, _ = check_retry_budget(state, "val_eng" if rc == "engineering" else "val_arch", max_retries=max_r)
     if not can_retry:
         return "requires_human"
 

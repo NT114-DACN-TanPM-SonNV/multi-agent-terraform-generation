@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+from collections import Counter
 
 from core.state import AgentState
 from core.llm import call_llm
@@ -59,7 +60,7 @@ def _planned_data_pairs(plan: dict) -> set[tuple[str, str]]:
 _DATA_DECL_RE = re.compile(r'data\s+"([^"]+)"\s+"([^"]+)"')
 
 
-def _boundary_defects(plan: dict, hcl: str) -> list[str]:
+def _boundary_defects(plan: dict, hcl: str, *, allow_extra_data: bool = False) -> list[str]:
     """Return plan-boundary defects in generated HCL."""
     planned = _planned_resource_pairs(plan)
     generated_list = _RESOURCE_DECL_RE.findall(hcl)
@@ -73,15 +74,17 @@ def _boundary_defects(plan: dict, hcl: str) -> list[str]:
     missing = sorted(f"{t}.{n}" for t, n in planned - generated)
     extra_data = sorted(f"data.{t}.{n}" for t, n in generated_data - planned_data)
     missing_data = sorted(f"data.{t}.{n}" for t, n in planned_data - generated_data)
-    dup = sorted(f"{t}.{n}" for t, n in {pair for pair in generated_list if generated_list.count(pair) > 1})
-    dup_data = sorted(f"data.{t}.{n}" for t, n in {pair for pair in generated_data_list if generated_data_list.count(pair) > 1})
+    _gen_counts = Counter(generated_list)
+    _data_counts = Counter(generated_data_list)
+    dup = sorted(f"{t}.{n}" for t, n in _gen_counts if _gen_counts[(t, n)] > 1)
+    dup_data = sorted(f"data.{t}.{n}" for t, n in _data_counts if _data_counts[(t, n)] > 1)
     if extra:
         defects.append("extra managed resources not in plan: " + ", ".join(extra))
     if missing:
         defects.append("missing managed resources from plan: " + ", ".join(missing))
     if dup:
         defects.append("duplicate managed resource declarations: " + ", ".join(dup))
-    if extra_data:
+    if extra_data and not allow_extra_data:
         defects.append("extra data sources not in plan: " + ", ".join(extra_data))
     if missing_data:
         defects.append("missing data sources from plan: " + ", ".join(missing_data))
@@ -209,7 +212,8 @@ def engineering_node(state: AgentState) -> dict:
                 raw_error=raw[:3000],
             )
 
-    defects = _boundary_defects(state["infrastructure_plan"], body)
+    is_repair = fix_feedback.get("root_cause") == "engineering"
+    defects = _boundary_defects(state["infrastructure_plan"], body, allow_extra_data=is_repair)
     if defects:
         logger.warning("Engineering agent: boundary defect — retry: %s", defects[:5])
         retry_msgs = messages + [
@@ -222,7 +226,7 @@ def engineering_node(state: AgentState) -> dict:
             raw, body = _run_engineering_attempt(retry_msgs)
         except Exception as e:
             return _make_engineering_failure(f"Engineering agent boundary retry error: {e}", "BOUNDARY_RETRY_LLM_ERROR", "boundary_retry", raw_error=str(e))
-        defects = _boundary_defects(state["infrastructure_plan"], body)
+        defects = _boundary_defects(state["infrastructure_plan"], body, allow_extra_data=is_repair)
         if defects:
             return _make_engineering_failure(
                 "Engineering agent kept violating the plan boundary after retry: "
