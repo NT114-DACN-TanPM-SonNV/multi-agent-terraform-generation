@@ -232,7 +232,8 @@ def _extract_results(final_state: dict, timings: dict, node_counts: dict, val_fe
             "error_label": dr.get("error_label") if not ok else None,
             "cleanup_error_label": dr.get("cleanup_error_label") if not ok else None,
             "resources_created": dr.get("resources_created", []),
-            "destroyed": dr.get("destroyed", False), "destroy_error": dr.get("destroy_error"),
+            "destroyed": dr.get("destroyed") or dr.get("partial_apply_destroyed", False),
+            "destroy_error": dr.get("destroy_error"),
             "apply_raw_error": (dr.get("apply_raw_error") or "")[:2000],
             "fix_instruction": (dr.get("fix_instruction") or "")[:500],
             "attempts": node_counts.get("deployment", 0),
@@ -273,6 +274,8 @@ def _render() -> str:
 def _run_row(idx, difficulty, prompt, gt_types, *, graph=None, no_deploy: bool = False) -> dict:
     _set(idx, "Architecture")
     run_dir = ROOT / "tmp" / f"row_{idx}"
+    if run_dir.exists():
+        _safe_rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     state = build_initial_state(prompt)
     state["run_dir"] = str(run_dir)
@@ -363,7 +366,7 @@ def _atomic_write(path: Path, results: list[dict]) -> None:
 
 
 def _load_existing(path: Path) -> list[dict]:
-    """Đọc output cũ cho --resume (chỉ giữ record hợp lệ có 'row' int)."""
+    """Đọc output cũ cho auto-resume (chỉ giữ record hợp lệ có 'row' int)."""
     if not path.exists():
         return []
     try:
@@ -384,8 +387,10 @@ def main():
     ap.add_argument("--shard", default=None,
                     help="i/n — chỉ chạy phần i của n (row idx %% n == i). Dùng chia "
                          "dataset cho nhiều process/account. VD: --shard 0/2 và --shard 1/2.")
-    ap.add_argument("--resume", action="store_true",
-                    help="Bỏ qua row đã có trong --out (tiếp tục run dở sau crash/rate-limit).")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Chạy LẠI TỪ ĐẦU: bỏ kết quả cũ trong --out, ghi đè. Mặc định là "
+                         "AUTO-RESUME (tự bỏ qua row đã có, chỉ chạy row còn thiếu sau khi bị "
+                         "ngắt). Dùng cờ này khi đã đổi prompt/code và muốn kết quả mới hoàn toàn.")
     ap.add_argument("--no-deploy", action="store_true",
                     help="Dừng sau A4 Validation — không terraform apply. "
                          "Kết quả plan-level, so fair với B0/B1/B2 baseline.")
@@ -402,18 +407,26 @@ def main():
         rows = [r for r in rows if r[0] % ntot == i]  # r[0] = row idx toàn cục → tmp/out không đụng
 
     results: list[dict] = []
-    if args.resume:
+    if args.overwrite:
+        # Cố ý chạy lại từ đầu (vd vừa đổi prompt) → bỏ kết quả cũ, file sẽ bị ghi đè.
+        if out_path.exists():
+            print(f"[overwrite] {out_path} đã tồn tại → ghi đè, bỏ qua kết quả cũ")
+    else:
+        # MẶC ĐỊNH auto-resume: row ĐÃ GHI trong --out (chạy trọn hoặc đã ghi sentinel)
+        # coi là "xong"; row bị NGẮT (Ctrl-C/crash) không được ghi → thiếu khỏi file → tự
+        # chạy lại (không nằm trong `done`). Đổi prompt/code mà muốn chạy mới: dùng --overwrite.
         results = _load_existing(out_path)
         done = {r["row"] for r in results}
         before = len(rows)
         rows = [r for r in rows if r[0] not in done]
         if done:
-            print(f"[resume] đã có {len(done)} row trong {out_path} → bỏ qua, còn {len(rows)}/{before}")
+            print(f"[resume] {len(done)} row đã có trong {out_path} → bỏ qua; chạy "
+                  f"{len(rows)}/{before} row còn thiếu. (đổi prompt? thêm --overwrite để chạy lại từ đầu)")
 
     shard_s = f" | shard={args.shard}" if args.shard else ""
     deploy_s = " | no-deploy" if args.no_deploy else ""
     print(f"eval.py | dataset={Path(args.dataset).name} | rows={len(rows)} | "
-          f"workers={args.workers}{shard_s}{deploy_s}{' | resume' if args.resume else ''}\n")
+          f"workers={args.workers}{shard_s}{deploy_s}{' | overwrite' if args.overwrite else ' | auto-resume'}\n")
 
     # Progress thread — vẽ in-place mỗi 1s.
     stop = threading.Event()
@@ -458,7 +471,7 @@ def main():
                 futs = {ex.submit(_one, ra): ra for ra in rows}
                 for fut, ra in futs.items():
                     try:
-                        _record(fut.result())
+                        _record(fut.result(timeout=3600))
                     except Exception as e:
                         _record(_timeout_sentinel(ra, error=str(e), no_deploy=args.no_deploy))
     except KeyboardInterrupt:
@@ -492,10 +505,12 @@ def _print_summary(results: list[dict], out_path: Path, no_deploy: bool = False)
     print(f"  {'Agent':<14}{'Pass/Total':<13}Percentage")
     print(f"  {'-' * 36}")
     _row("Architecture", ok["architecture"], n)
-    _row("Security",     ok["security"],     ok["architecture"])
-    _row("Engineering",  ok["engineering"],  ok["architecture"])
+    _row("Security",     ok["security"],     n)
+    _row("Engineering",  ok["engineering"],  n)
     _row("Validation",   ok["validation"],   ok["engineering"])
     if not no_deploy:
+        # Deployment: always use total cases (n), not cascading denominator.
+        # Reflects deploy success over entire dataset (e.g., 14/17, not 14/16).
         _row("Deployment",   ok["deployment"],   n)
 
     tt = [r["total_elapsed_s"] for r in results if r.get("total_elapsed_s")]

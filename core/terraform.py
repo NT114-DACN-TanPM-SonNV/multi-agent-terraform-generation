@@ -23,6 +23,7 @@ _TF_INIT_LOCK = threading.Lock()
 
 # Shared subprocess environment with offline plugin cache.
 _TF_ENV = {**os.environ}
+_TF_ENV.pop("TF_PLUGIN_CACHE_DIR", None)  # conflicts with -plugin-dir (same dir → install-to-itself)
 for _proxy_key in (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "all_proxy",
@@ -274,7 +275,9 @@ def write_terraform_dir(tmpdir: str | Path, code: str,
     stub_zip: bytes | None = None
     seen: set[str] = set()
     for m in _LOCAL_FILE_PATTERNS.finditer(code):
-        raw = next(g for g in m.groups() if g)  # lấy group đầu tiên không None
+        raw = next((g for g in m.groups() if g), None)
+        if raw is None:
+            continue
         if raw in seen:
             continue
         raw_l = raw.lower()

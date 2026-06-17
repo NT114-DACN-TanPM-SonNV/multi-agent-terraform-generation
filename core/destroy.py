@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _DESTROY_TIMEOUT             = 600  # ElastiCache/RDS cần 5-10 phút để xóa
-_MAX_DESTROY_TRANSIENT_RETRY = 1
-_DESTROY_RETRY_BACKOFF       = 5
+_MAX_DESTROY_TRANSIENT_RETRY = 2    # thêm 1 retry cho transient
+_DESTROY_RETRY_BACKOFF       = 10
 _DESTROY_OVERRIDE_NAME       = "destroy_override.tf"
 
 # ── Async destroy queue ───────────────────────────────────────────────────────
@@ -32,9 +32,11 @@ def _worker_fn() -> None:
             break
         workdir, code = item
         try:
-            destroy_with_override(workdir, code)
+            ok, err = destroy_with_override(workdir, code)
+            if not ok:
+                logger.warning("Destroy queue FAILED for %s: %s", workdir, err)
         except Exception as e:
-            logger.warning("Destroy worker error: %s", e)
+            logger.warning("Destroy worker error for %s: %s", workdir, e)
         finally:
             try:
                 _safe_rmtree(str(workdir))
@@ -52,7 +54,7 @@ def start_destroy_worker() -> None:
     logger.info("Destroy worker started")
 
 
-def shutdown_destroy_worker(timeout: int = _DESTROY_TIMEOUT + 120) -> None:
+def shutdown_destroy_worker(timeout: int = _DESTROY_TIMEOUT * 4) -> None:
     """Gửi sentinel, chờ queue drain hết rồi mới return."""
     if _Q is None:
         return
@@ -89,14 +91,30 @@ _DESTROY_PATCHES = [
     (r'(apply_immediately\s*=\s*)false',             r'\g<1>true'),   # RDS
     (r'(automatic_failover_enabled\s*=\s*)true',     r'\g<1>false'),  # ElastiCache
     (r'(multi_az_enabled\s*=\s*)true',               r'\g<1>false'),  # ElastiCache
+    (r'(force_destroy\s*=\s*)false',                 r'\g<1>true'),   # S3 bucket với objects
 ]
+
+# Inject force_destroy vào aws_s3_bucket block nếu chưa có — tránh BucketNotEmpty khi destroy.
+_S3_FORCE_DESTROY_RE = re.compile(
+    r'(resource\s+"aws_s3_bucket"\s+"[^"]+"\s*\{)([^}]*?)(\})',
+    re.DOTALL,
+)
+
+def _inject_s3_force_destroy(code: str) -> str:
+    def _add(m: re.Match) -> str:
+        body = m.group(2)
+        if 'force_destroy' not in body:
+            body = body.rstrip() + '\n  force_destroy = true\n'
+        return m.group(1) + body + m.group(3)
+    return _S3_FORCE_DESTROY_RE.sub(_add, code)
 
 # Patch and destroy helpers.
 
 def patch_for_destroy(code: str) -> str:
-    """Patch HCL to disable deletion protection before destroy."""
+    """Patch HCL to disable deletion protection and blockers before destroy."""
     for pattern, replacement in _DESTROY_PATCHES:
         code = re.sub(pattern, replacement, code)
+    code = _inject_s3_force_destroy(code)
     return code
 
 
@@ -183,4 +201,4 @@ def destroy_resources(
         logger.warning("Destroy FAILED: %s", error_msg)
         return False, error_msg
 
-    return True, None  # Shouldn't reach here, but fallback
+    raise RuntimeError("destroy_resources: loop exhausted without returning")

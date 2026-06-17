@@ -77,13 +77,15 @@ def _state_resources(tmpdir: str) -> list:
 
 def _llm_classify(error_text: str, resource_labels: list[str],
                   failed_resource: str | None, partial: bool,
-                  destroyed: bool, retry: int) -> tuple[str, str | None]:
+                  destroyed: bool, retry: int,
+                  prev_fixes: str = "") -> tuple[str, str | None]:
     """LLM phân loại apply error. Fallback UNKNOWN nếu LLM fail."""
     ctx = CLASSIFY_TEMPLATE.format(
         labels=json.dumps(resource_labels),
         failed=failed_resource or "unknown",
         error=error_text[:2000],
         partial=partial, destroyed=destroyed, retry=retry,
+        prev_fixes=prev_fixes,
     )
     try:
         parsed = parse_llm_json(
@@ -127,9 +129,17 @@ def _handle_failure(state: AgentState, tmpdir: str,
     if error_type is None:
         plan = state.get("infrastructure_plan") or {}
         labels = [f"{r['type']}.{r['name']}" for r in plan.get("resources", [])]
+        _prev = [h.get("fix_instruction", "") for h in
+                 (state.get("eng_error_history") or []) + (state.get("arch_error_history") or [])]
+        _prev = [p for p in _prev if p][-4:]
+        prev_fixes = (
+            "\n\nPREVIOUS FIX ATTEMPTS (already tried — do NOT repeat):\n"
+            + "\n".join(f"- {p[:200]}" for p in _prev)
+        ) if _prev else ""
         error_type, fix = _llm_classify(
             error_text, labels, None, bool(created), partial_destroyed,
             state["retries"].get("deploy_eng", {}).get("count", 0),
+            prev_fixes=prev_fixes,
         )
 
     logger.warning(
@@ -149,6 +159,7 @@ def _handle_failure(state: AgentState, tmpdir: str,
     if error_type in retry_config:
         retry_key, cause = retry_config[error_type]
         increment_retry(state, retry_key, error_type, error_text[:200])
+        state["total_deploy_attempts"] += 1
         root_cause = cause
         predicted_route = cause
         fix_feedback = {
