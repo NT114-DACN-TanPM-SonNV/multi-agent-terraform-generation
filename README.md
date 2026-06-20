@@ -21,7 +21,8 @@
 </p>
 
 
-<img width="2125" height="907" alt="image" src="https://github.com/user-attachments/assets/07ad03c5-55c4-4706-99da-ce5c64228c2d" />
+<img width="1999" height="917" alt="image" src="https://github.com/user-attachments/assets/d2a05c0f-6ba7-4be2-a5f8-527bdc713cdf" />
+
 
 <p align="center">
   <em>Hình 2: Sơ đồ quy trình triển khai.</em>
